@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import copy
+import pickle
+
 import numpy as np
 import pytest
 
@@ -265,3 +268,74 @@ def test_delisting_closes_and_missing_bar_holds(env):
     np.testing.assert_array_equal(p.position[last_b:, 1], 0.0)
     solo = res.components["BBBUSDT"]
     assert solo.position[-1, 0] == 0.0 and solo.end_ms == int(d.open_ms[29]) + 3_600_000
+
+
+def test_signal_hygiene_delay_and_result_plumbing(env):
+    """inf is "no signal"; a longer delay moves the fill bar; results survive pickling;
+    names label the accounts; the saved config says which allocation was used."""
+    for i, sym in enumerate(["AAAUSDT", "BBBUSDT"]):
+        close, vol = bar_blocks(60, K, seed=50 + i)
+        env.klines(sym, "2024-01-01", close, volume=vol)
+    d = bt.load("AAAUSDT", "1h")
+    sig = np.zeros(d.T)
+    sig[10] = 1.0
+    sig[20] = np.inf  # e.g. a division by zero upstream
+    r1 = bt.run(sig, d, price="open", fee=0.0)
+    assert r1.open_ms[np.flatnonzero(r1.position[:, 0])].tolist() == [int(d.open_ms[11])]
+    assert not r1.bankrupt and np.isfinite(r1.nav).all()
+    r3 = bt.run(sig, d, price="open", fee=0.0, delay=3)
+    assert r3.open_ms[np.flatnonzero(r3.position[:, 0])].tolist() == [int(d.open_ms[13])]
+    assert r1.config["exec_window"] is None
+    assert (
+        bt.run(sig, d, price="open", exec_window=15).config["exec_window"] is None
+    )  # no window for open
+    assert bt.run(sig, d, price="twap", exec_window=15).config["exec_window"] == 15
+    np.testing.assert_allclose(np.cumprod(1 + r1.series()["ret"].to_numpy()), r1.nav, rtol=1e-12)
+
+    dd = bt.load(["AAAUSDT", "BBBUSDT"], "1h")
+    s2 = np.random.default_rng(0).uniform(-1, 1, (dd.T, 2))
+    w = np.full((dd.T, 2), 0.5)
+    w[30, 0] = np.inf
+    pr = bt.run(s2, dd, alloc=w, names=["a", "b"])
+    assert np.abs(pr.portfolio.position).max() <= 0.5 + 1e-12
+    assert [b.name for b in pr.components] == ["a", "b"]
+    for clone in (pickle.loads(pickle.dumps(pr)), copy.copy(pr)):
+        np.testing.assert_array_equal(clone.nav, pr.nav)
+    assert pr.config["alloc"] == "array(60, 2)"
+    label = bt.run(s2, dd, alloc=bt.alloc.rolling_sharpe(12, rebalance_every=4)).config["alloc"]
+    assert label == "rolling_sharpe(window=12, floor=0.0, normalize=True, rebalance_every=4)"
+
+    # a callable and custom(callable) mean the same thing: NaN rows allocate nothing
+    def half_after_20(ctx):
+        out = np.full(ctx.listed.shape, np.nan)
+        out[20:] = 0.5
+        return out
+
+    direct = bt.run(s2, dd, alloc=half_after_20).portfolio
+    wrapped = bt.run(s2, dd, alloc=bt.alloc.custom(half_after_20)).portfolio
+    np.testing.assert_array_equal(direct.alloc, wrapped.alloc)
+    np.testing.assert_array_equal(direct.nav, wrapped.nav)
+    assert (direct.position[direct.open_ms <= dd.open_ms[20]] == 0).all()
+
+
+def test_external_signal_is_aligned_by_the_time_it_became_known(env):
+    """A value known at tau lands on the bar with open < tau <= close and trades in the
+    bar after it - so something known exactly at a bar close can trade the next open."""
+    close, vol = bar_blocks(30, K, seed=60)
+    env.klines("BTCUSDT", "2024-01-01", close, volume=vol)
+    d = bt.load("BTCUSDT", "1h")
+    known_at = [
+        d.close_ts[4],
+        d.ts[9] + np.timedelta64(1, "ms"),
+        d.close_ts[9] - np.timedelta64(1, "m"),
+    ]
+    sig = d.align(known_at, [1.0, 0.3, 0.7])
+    assert np.flatnonzero(np.isfinite(sig)).tolist() == [4, 9]
+    assert sig[4] == 1.0 and sig[9] == 0.7  # the later of two values inside bar 9 wins
+    res = bt.run(sig, d, price="open", fee=0.0)
+    held = {int(t): p for t, p in zip(res.open_ms, res.position[:, 0], strict=True) if p}
+    assert held == {int(d.open_ms[5]): 1.0, int(d.open_ms[10]): 0.7}
+    filled = d.align(known_at, [1.0, 0.3, 0.7], ffill=True)
+    assert np.isnan(filled[:4]).all() and (filled[4:9] == 1.0).all() and (filled[9:] == 0.7).all()
+    # a value stamped at a bar's own open belongs to the bar that just closed
+    assert np.flatnonzero(np.isfinite(d.align([d.ts[6]], [5.0]))).tolist() == [5]

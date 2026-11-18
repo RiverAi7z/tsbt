@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 
+import bottleneck as bn
 import numpy as np
 
 from tsbt.config import DAY_MS
@@ -49,24 +50,19 @@ def sharpe(r: np.ndarray) -> float:
     return float(r.mean() / sd * math.sqrt(ANN))
 
 
-def max_drawdown(nav: np.ndarray, compound: bool) -> float:
-    nav = np.asarray(nav, dtype=np.float64)
-    peak = np.maximum.accumulate(nav)
-    if compound:
-        with np.errstate(divide="ignore", invalid="ignore"):
-            dd = np.where(peak > 0, nav / peak - 1.0, -1.0)
-    else:
-        dd = nav - peak
-    return float(dd.min()) if len(dd) else math.nan
-
-
 def drawdown_series(nav: np.ndarray, compound: bool) -> np.ndarray:
+    """Drawdown from the running peak: relative (compound) or in principal units (simple)."""
     nav = np.asarray(nav, dtype=np.float64)
     peak = np.maximum.accumulate(nav)
     if compound:
         with np.errstate(divide="ignore", invalid="ignore"):
             return np.where(peak > 0, nav / peak - 1.0, -1.0)
     return nav - peak
+
+
+def max_drawdown(nav: np.ndarray, compound: bool) -> float:
+    dd = drawdown_series(nav, compound)
+    return float(dd.min()) if len(dd) else math.nan
 
 
 def apr(nav_end: float, days: float, compound: bool) -> float:
@@ -101,8 +97,6 @@ def perf(times: np.ndarray, nav: np.ndarray, turnover: np.ndarray, compound: boo
 
 def rolling_sharpe(times: np.ndarray, nav: np.ndarray, compound: bool, window_days: int = 90):
     """Daily rolling Sharpe; returns (day-end times, values)."""
-    import bottleneck as bn
-
     t, dv = daily_values(times, nav)
     r = period_returns(dv, compound)
     if len(r) < 2:

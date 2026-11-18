@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import threading
+import time
+
 import numpy as np
 import polars as pl
 import pytest
@@ -68,6 +71,14 @@ def test_partial_bars_dropped_and_gaps_are_nan(env):
     m = d.m1
     assert np.isnan(m.close[90])  # 05:30 is minute 90 of the 04:00 bar
     assert d.volume[0] == pytest.approx(np.nansum(m.volume[:240]))
+    # a symbol that never completes a daily bar: unusable alone, and it must not stretch
+    # the common time axis of a multi-symbol load
+    with pytest.raises(ValueError, match="no complete bars"):
+        bt.load("NEWUSDT", "1D")
+    full, fv = bar_blocks(3, 1440, seed=12)
+    env.klines("OLDUSDT", "2023-12-25", full, volume=fv)
+    both = bt.load(["OLDUSDT", "NEWUSDT"], "1D")
+    assert both.T == 3 and both.listed.sum(axis=0).tolist() == [3, 0]
 
 
 def test_cache_reuse_incremental_append_and_monthly_precedence(env, monkeypatch):
@@ -103,6 +114,16 @@ def test_cache_reuse_incremental_append_and_monthly_precedence(env, monkeypatch)
     assert calls == ["BTCUSDT-1m-2024-01.parquet"]
     assert d.T == 31 * 24
     np.testing.assert_array_equal(d.close, full.reshape(-1, 60)[:, -1])
+
+    # the monthly file is withdrawn again: back to the four daily files, and the days
+    # that no longer have any source stop counting as listed
+    calls.clear()
+    env.file("klines", "BTCUSDT", "2024-01", kind="monthly").unlink()
+    d = bt.load("BTCUSDT", "1h")
+    assert sorted(calls) == [f"BTCUSDT-1m-2024-01-0{i}.parquet" for i in (1, 2, 3, 4)]
+    assert d.T == 96 and str(d.close_ts[-1]) == "2024-01-05T00:00:00.000"
+    np.testing.assert_array_equal(d.close[:72], first)
+    np.testing.assert_array_equal(d.close[72:], more.reshape(-1, 60)[:, -1])
 
 
 def test_metrics_are_causally_aligned(env):
@@ -148,8 +169,8 @@ def _trades(env, days=2, seed=0):
     )
 
 
-def test_user_features_three_styles_resume_and_invalidation(env, monkeypatch):
-    tr = _trades(env)
+def test_user_features_three_styles_resume_and_invalidation(env):
+    tr = _trades(env, days=5)
     bt.feature_set(
         "flow",
         source="aggTrades",
@@ -172,6 +193,7 @@ def test_user_features_three_styles_resume_and_invalidation(env, monkeypatch):
     @bt.feature_set("pyfeat", source="aggTrades", outputs=["sell_qty"], bar_agg={"sell_qty": "sum"})
     def pyfeat(chunk):
         state["calls"] += 1
+        time.sleep(0.05)
         if state["fail"] and "2024-01-02" in chunk.path:
             raise RuntimeError("boom")
         return (
@@ -197,14 +219,16 @@ def test_user_features_three_styles_resume_and_invalidation(env, monkeypatch):
     np.testing.assert_array_equal(d.n_tr, by_bar["n"].to_numpy())
     np.testing.assert_allclose(d.max_amt, by_bar["mx"].to_numpy(), rtol=1e-12)
 
-    # Python feature: crash on the 2nd file; the 1st is already persisted and not redone
-    monkeypatch.setattr(m1, "FLUSH_SECONDS", 0.0)
+    # Python feature: crash on the 2nd of 5 files. The finished file is kept, the queued
+    # ones are not started, and the retry only computes what is missing.
     with pytest.raises(RuntimeError, match="boom"):
         bt.load("BTCUSDT", "1h", fields=["sell_qty"], workers=1)
-    assert state["calls"] == 2
+    assert state["calls"] <= 3
+    built = list(m1.manifest("BTCUSDT", "feat:pyfeat")["files"])
+    assert built == ["BTCUSDT-aggTrades-2024-01-01.parquet"]
     state.update(fail=False, calls=0)
     d = bt.load("BTCUSDT", "1h", fields=["sell_qty"], workers=1)
-    assert state["calls"] == 1
+    assert state["calls"] == 4
     sell = (
         tr.filter(pl.col("maker"))
         .with_columns(bar=(pl.col("ts") - ms("2024-01-01")) // 3_600_000)
@@ -239,6 +263,63 @@ def test_user_features_three_styles_resume_and_invalidation(env, monkeypatch):
     )
     with pytest.raises(ValueError, match="multiple of 60000|one row per minute"):
         bt.load("BTCUSDT", "1h", fields=["px"])
+    # ... and so are options that would silently do something else
+    amt = {"amt": "sum(price*quantity)"}
+    with pytest.raises(ValueError, match="not outputs"):  # misspelt key -> default 'last' rule
+        bt.feature_set("typo", source="aggTrades", sql=amt, bar_agg={"amnt": "sum"})
+    with pytest.raises(ValueError, match="not one of"):
+        bt.feature_set("typo", source="aggTrades", sql=amt, bar_agg={"amt": "summ"})
+    with pytest.raises(ValueError, match="not outputs"):
+        bt.feature_set("typo", source="aggTrades", sql=amt, fill={"amtt": 0.0})
+
+
+def test_feature_builds_never_oversubscribe_the_cpus(env, monkeypatch):
+    """files in parallel x DuckDB threads per file stays within the core count."""
+    _trades(env, days=6)
+    monkeypatch.setattr("os.cpu_count", lambda: 8)
+    running, peak = [0], [0]
+    lock = threading.Lock()
+
+    @bt.feature_set("busy", source="aggTrades", outputs=["n"], threads=4)
+    def busy(chunk):
+        with lock:
+            running[0] += 1
+            peak[0] = max(peak[0], running[0])
+        time.sleep(0.05)
+        out = chunk.sql(
+            "SELECT (transact_time // 60000) * 60000 AS ts, count(*) AS n FROM {src} GROUP BY 1"
+        )
+        with lock:
+            running[0] -= 1
+        return out
+
+    bt.load("BTCUSDT", "1h", fields=["n"], workers=8)
+    assert peak[0] == 2  # 8 cores / 4 threads per file
+
+
+def test_cache_cli_build_status_clear(env, capsys):
+    from tsbt import cli
+
+    close, vol = bar_blocks(2, 1440, seed=13)
+    env.klines("BTCUSDT", "2024-01-01", close, volume=vol)
+    assert cli.main(["cache", "status"]) == 0 and "(empty)" in capsys.readouterr().out
+    with pytest.raises(SystemExit):  # building everything must be asked for with --all
+        cli.main(["cache", "build"])
+    capsys.readouterr()
+    assert cli.main(["cache", "build", "--symbols", "BTCUSDT", "--fields", "closee"]) == 2
+    assert "unknown field" in capsys.readouterr().err
+    assert cli.main(["cache", "build", "--all"]) == 0 and "BTCUSDT: ok" in capsys.readouterr().out
+    assert cli.main(["cache", "build", "--symbols", "BTCUSDT", "NOPEUSDT", "--freq", "1h"]) == 0
+    out = capsys.readouterr().out
+    assert "BTCUSDT: ok" in out and "NOPEUSDT: skipped" in out
+    assert cli.main(["cache", "status"]) == 0
+    assert "klines[2 files 2024-01-01..2024-01-02]" in capsys.readouterr().out
+    before = bt.load("BTCUSDT", "1h").close.copy()
+    assert cli.main(["cache", "clear", "--symbol", "BTCUSDT", "--field", "close"]) == 0
+    np.testing.assert_array_equal(bt.load("BTCUSDT", "1h").close, before)  # rebuilt from source
+    assert cli.main(["cache", "clear"]) == 0
+    capsys.readouterr()
+    assert cli.main(["cache", "status"]) == 0 and "(empty)" in capsys.readouterr().out
 
 
 def test_intrabar_aggregation_matches_naive_loop(env):

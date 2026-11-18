@@ -222,12 +222,13 @@ def compute_bar_field(symbol: str, name: str, j0: int, j1: int, k: int, offset: 
         raise ValueError(f"exec window must be in [1, {k}] minutes, got {w}")
     nb = j1 - j0
     if base in ("vwap", "twap"):
-        px = catalog.minute_values(symbol, "twap", s_ms, e_ms).reshape(nb, k)[:, :w]
-        twap = REDUCERS["mean"](px)
+        qv, v, c = (
+            m1.read_minutes(symbol, f, s_ms, e_ms).reshape(nb, k)[:, :w]
+            for f in ("quote_volume", "volume", "close")
+        )
+        twap = REDUCERS["mean"](catalog.minute_price(qv, v, c))
         if base == "twap":
             return twap
-        qv = m1.read_minutes(symbol, "quote_volume", s_ms, e_ms).reshape(nb, k)[:, :w]
-        v = m1.read_minutes(symbol, "volume", s_ms, e_ms).reshape(nb, k)[:, :w]
         sq, sv = _red_sum(qv), _red_sum(v)
         with np.errstate(invalid="ignore", divide="ignore"):
             vwap = sq / sv

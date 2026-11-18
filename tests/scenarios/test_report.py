@@ -14,7 +14,7 @@ REQUIRED = {"apr", "sharpe", "calmar", "turnover", "mdd", "start", "end", "days"
 PNGS = {"nav.png", "position.png", "long_short.png", "periodic.png", "rolling_sharpe.png"}
 
 
-def test_save_single_and_portfolio_reports(env, tmp_path):
+def test_save_single_and_portfolio_reports(env, tmp_path, monkeypatch):
     for i, sym in enumerate(["AAAUSDT", "BBBUSDT"]):
         close, vol = bar_blocks(24 * 70, 60, seed=30 + i)
         env.klines(sym, "2024-01-01", close, volume=vol)
@@ -25,6 +25,17 @@ def test_save_single_and_portfolio_reports(env, tmp_path):
     assert REQUIRED <= set(m) and all(m[k] is not None for k in REQUIRED - {"calmar"})
     for p in PNGS:
         assert (out / p).stat().st_size > 10_000, p
+    # in a notebook: one figure renders by itself, all five render through the container
+    import IPython.display
+    import xy.pyplot as plt
+
+    shown = []
+    monkeypatch.setattr(IPython.display, "display", shown.append)
+    figs = bt.run(sig, d).plot()
+    assert list(figs) == ["nav", "position", "long_short", "periodic", "rolling_sharpe"]
+    figs._ipython_display_()
+    assert shown == list(figs.values()) and "<" in figs["nav"]._repr_html_()
+    assert plt.get_fignums() == []  # nothing accumulates in pyplot's registry
     s = pl.read_parquet(out / "series.parquet")
     assert {"nav", "nav_gross", "benchmark", "turnover", "fee"} <= set(s.columns)
 

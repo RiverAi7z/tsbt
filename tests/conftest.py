@@ -87,7 +87,7 @@ class Market:
                 "timestamp": ts_ms,
             }
         )
-        self._split(df, "timestamp", "metrics", sym, kind, keep_order=True)
+        self._split(df, "timestamp", "metrics", sym, kind)
 
     # ------------------------------------------------------------------ aggTrades
     def agg_trades(self, sym: str, ts_ms, price, qty, buyer_maker, kind: str = "daily"):
@@ -108,7 +108,7 @@ class Market:
         self._split(df, "transact_time", "aggTrades", sym, kind)
 
     # ------------------------------------------------------------------ helpers
-    def _split(self, df, tcol, dataset, sym, kind, sub=None, label=None, keep_order=False):
+    def _split(self, df, tcol, dataset, sym, kind, sub=None, label=None):
         label = label or dataset
         fmt = "%Y-%m-%d" if kind == "daily" else "%Y-%m"
         period = pl.from_epoch(pl.col(tcol), time_unit="ms").dt.strftime(fmt)
@@ -119,7 +119,7 @@ class Market:
         for (per,), part in df.with_columns(_p=period).group_by("_p", maintain_order=True):
             part.drop("_p").write_parquet(base / f"{sym}-{label}-{per}.parquet")
 
-    def file(self, dataset, sym, period, kind="daily", sub=None) -> Path:
+    def file(self, dataset, sym, period, kind="daily") -> Path:
         label = "1m" if dataset == "klines" else dataset
         base = self.root / kind / dataset / sym
         if dataset == "klines":
@@ -141,11 +141,6 @@ def env(tmp_path):
     features.FEATURES.clear()
     features.FEATURES.update(saved)
     config.reset_paths()
-    store.forget()
-
-
-def use_cache(path: Path):
-    config.set_paths(cache_dir=path)
     store.forget()
 
 

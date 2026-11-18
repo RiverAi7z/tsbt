@@ -115,6 +115,9 @@ def run(
     ``signal[t]`` is the target position computed with information up to the close of
     bar t; it is executed inside bar ``t + delay`` at ``price`` (open / twap / vwap /
     close of that bar). The engine does the shift - never shift the signal yourself.
+    NaN and +-inf both mean "no signal" (see ``nan_policy``).
+
+    ``names`` labels the signal columns (the per-symbol accounts in portfolio mode).
 
     Returns :class:`Result` (one account), :class:`BatchResult` (independent columns)
     or :class:`PortfolioResult` (shared capital pool).
@@ -125,6 +128,7 @@ def run(
     if fee < 0:
         raise ValueError("fee must be >= 0")
     sig = np.asarray(signal, dtype=np.float64)
+    sig = np.where(np.isfinite(sig), sig, np.nan)  # +-inf is "no signal", not a huge position
     if sig.ndim == 1:
         sig = sig[:, None]
     if sig.ndim != 2 or sig.shape[0] != data.T:
@@ -155,6 +159,8 @@ def run(
     if alloc is not None and mode != "portfolio":
         raise ValueError("alloc only applies to mode='portfolio'")
 
+    if price not in ("twap", "vwap") or exec_window == data.k:
+        exec_window = None  # only twap / vwap have a window; the whole bar is the default
     P = data.exec_price(price, exec_window)[:, colmap]
     C = data.raw("close")[:, colmap]
     listed = data.listed[:, colmap]
@@ -168,7 +174,7 @@ def run(
         raise ValueError("evaluation window has fewer than 2 bars")
 
     s_full = _shift(sig, delay)
-    w_full = None
+    w_full = wb = None
     if mode == "portfolio":
         p_full = _prepare(s_full, P, C, listed, nan_policy)
         ctx = alloc_mod.AllocContext(
@@ -179,8 +185,8 @@ def run(
             listed=listed,
             _independent=lambda: _independent_returns(p_full, fee, compound),
         )
-        w_full = _shift(alloc_mod.resolve(alloc, ctx), delay)
-        w_full = np.nan_to_num(w_full, nan=0.0)
+        w_full = np.nan_to_num(_shift(alloc_mod.resolve(alloc, ctx), delay), nan=0.0)
+        wb = alloc_mod.benchmark_weights(alloc, ctx)
 
     sl = slice(i0, i1)
     p = _prepare(s_full[sl], P[sl], C[sl], listed[sl], nan_policy)
@@ -198,9 +204,7 @@ def run(
         nan_policy=nan_policy,
         freq=data.freq,
         symbols=list(data.symbols),
-        alloc=type(alloc).__name__
-        if alloc is not None and not isinstance(alloc, np.ndarray)
-        else ("array" if alloc is not None else "equal"),
+        alloc=alloc_mod.describe(alloc) if mode == "portfolio" else None,
     )
     n = i1 - i0
     rows = np.arange(n)[:, None]
@@ -247,10 +251,15 @@ def run(
     a = int(p.start[p.start >= 0].min())
     after = rows >= a
     theta = _positions(w * p.target, p) * after
-    bench_t = _positions(w * np.ones_like(p.target), p) * after
     net = simulate(theta, p.R, p.b, fee, compound, pooled=True)
     gross = simulate(theta, p.R, p.b, 0.0, compound, pooled=True)
-    bench = simulate(bench_t, p.R, p.b, 0.0, compound, pooled=True)
+    # Benchmark: buy each symbol once with its weight - at the start, or when it lists -
+    # and never rebalance; capital waiting for a listing (or left over) stays in cash.
+    # A column held at 1x in its own account is exactly "bought once and held".
+    held = simulate(
+        _positions(np.ones_like(p.target), p) * after, p.R, p.b, 0.0, True, pooled=False
+    )
+    bench_nav = (1.0 - wb.sum()) + held.nav @ wb
     r = slice(a, n)
     tr = theta[r] * p.R[r]
     port = Result(
@@ -260,7 +269,7 @@ def run(
         k_ms=k_ms,
         nav=net.nav[r, 0],
         nav_gross=gross.nav[r, 0],
-        bench=bench.nav[r, 0],
+        bench=bench_nav[r],
         turnover=net.turnover[r, 0],
         fee_paid=net.fee[r, 0],
         position=theta[r],
@@ -286,6 +295,7 @@ def run(
         nan_policy=nan_policy,
         start=start,
         end=end,
+        names=names,
     )
     if isinstance(components, Result):
         components = BatchResult([components])

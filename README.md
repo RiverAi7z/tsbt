@@ -22,7 +22,7 @@ res = bt.run(sig, d, price="vwap", fee=2e-4)     # 复利、延迟 1 根 bar 成
 print(res)                  # apr / sharpe / mdd / calmar / turnover
 res.summary()               # polars DataFrame，含 start end days 及附加指标
 res.yearly(); res.monthly(); res.daily()
-res.plot()                  # 5 张图（xy）
+res.plot()                  # 5 张图（xy）；notebook 里逐张显示，res.plot("nav") 只画一张
 res.save("runs/btc_mom_4h") # metrics.json config.json series.parquet yearly.parquet *.png
 ```
 
@@ -32,7 +32,7 @@ res.save("runs/btc_mom_4h") # metrics.json config.json series.parquet yearly.par
 - `signal[t]` 视为“截至 bar t 收盘可知”。**引擎统一做位移**：在 bar `t+delay` 内部按 `price` 成交，`delay` 默认 1，`delay < 1` 直接报错。**不要自己 shift 信号。**
 - `price`：`open`（T 的第一根 1m open）、`close`（T 的最后一根 1m close）、`twap`（T 内各分钟 VWAP 的等权均值）、`vwap`（T 内 Σ成交额/Σ成交量，零成交时退化为 twap）。`exec_window=N` 只用 bar 开头 N 分钟算 twap/vwap。
 - 净值按 bar 收盘价盯市；结果的时间戳是 bar 收盘时刻。
-- 结果从“第一根有可用信号的 bar”开始（这根 bar 开盘时净值 = 1）。信号 NaN 默认平仓（`nan_policy="flat"`），可改为沿用上一目标（`"hold"`）。
+- 结果从“第一根有可用信号的 bar”开始（这根 bar 开盘时净值 = 1）。信号里的 NaN 和 ±inf 都表示“无信号”，默认平仓（`nan_policy="flat"`），可改为沿用上一目标（`"hold"`）。
 
 ## 费用与换手
 
@@ -56,7 +56,7 @@ res.save("runs/btc_mom_4h") # metrics.json config.json series.parquet yearly.par
 `apr sharpe calmar turnover mdd start end days`，另附 `total_return apr_gross sharpe_gross fee_drag avg_abs_pos long_ratio bench_apr bench_sharpe bench_mdd bankrupt`。
 
 - Sharpe 统一用 **UTC 日频**净值收益 × √365，所以不同 bar 频率的结果可以直接比较。首尾不足一天的部分各算一个观测。MDD 用 bar 级净值。
-- 基准 = 同一标的、信号恒为 1、同一资金口径和分配规则、费率 0（单标的复利即买入持有）。
+- 基准 = 同一标的、信号恒为 1、同一资金口径、费率 0（单标的复利即买入持有）。组合的基准是**买入不动**的篮子：每个标的在起点（晚上市的在上市时）按权重买入一次，之后不调仓，等待上市的份额是现金。它不依赖策略表现：静态分配时初始权重与分配相同，动态分配（滚动 Sharpe、反波动、时变数组、自定义函数）时用等权 `1/N`。
 
 ## 多标的
 
@@ -71,7 +71,8 @@ pr.contrib()      # 各标的的盈亏 / 换手贡献
 pr.components["ETHUSDT"].plot("nav")
 
 br = bt.run(sig, d, mode="independent")            # 每列一个独立账户
-bt.run(np.column_stack([s1, s2, s3]), bt.load("BTCUSDT", "4h"))   # 单标的 K 组参数批量
+bt.run(np.column_stack([s1, s2, s3]), bt.load("BTCUSDT", "4h"),
+       names=["fast", "mid", "slow"])              # 单标的 K 组参数批量
 ```
 
 资金分配 `alloc=`（行 t 视为 bar t 收盘可知，和信号一样由引擎延迟）：
@@ -98,7 +99,7 @@ bt.run(np.column_stack([s1, s2, s3]), bt.load("BTCUSDT", "4h"))   # 单标的 K 
 - 内置字段：`open high low close volume quote_volume count taker_buy_volume taker_buy_quote_volume vwap twap`（klines）；`oi oi_value top_ls_acct top_ls_pos ls_acct taker_ls_vol`（metrics，5 分钟一条，bar 取最后一条；记录时间恰在 bar 边界时归入下一根 bar）。
 
 ```bash
-uv run tsbt cache build --symbols BTCUSDT ETHUSDT --freq 1h 4h   # 预热
+uv run tsbt cache build --symbols BTCUSDT ETHUSDT --freq 1h 4h   # 预热（全部标的用 --all）
 uv run tsbt cache status
 uv run tsbt cache clear --symbol ETHUSDT
 ```
@@ -116,6 +117,7 @@ q90 = d.agg(m.close, "quantile", q=0.9)
 x   = d.agg(m.volume, "sum", window=30)      # 只用 bar 开头 30 分钟
 y   = d.agg(m.high - m.low, lambda b: np.nanmax(b, axis=1))   # 任意可调用，b 形状 (T, k[, N])
 d.save_field("rv", rv)                        # 缓存；之后 bt.load(..., fields=["rv"])
+                                              # overwrite=True 整体替换，范围外的旧值丢弃
 ```
 
 内置归约：`sum mean std var first last max min median count skew kurt quantile`。
@@ -144,14 +146,16 @@ def custom(chunk: bt.SourceChunk):
 ```
 
 - 输出每分钟至多一行，`ts` 是 60000 的整数倍且落在该文件的时间范围内，否则报错。
-- 每个源文件（一个月或一天）单独计算、单独缓存，跨文件的状态不可见。中断后重跑只补未完成的文件。
+- 每个源文件（一个月或一天）单独计算、单独缓存，跨文件的状态不可见。出错或 Ctrl-C 时已算完的文件会先落盘，重跑只补未完成的文件。
 - 定义改变（SQL 文本 / 函数源码 + `version`）只重算该特征集。
+- 并发文件数 × 每个文件的 DuckDB 线程数（`threads=`，默认 4）不会超过机器核数。
+- `bar_agg` / `fill` 的键必须是输出列名，`bar_agg` 的值必须是内置归约名（`sum mean last max ...`），拼错会直接报错。
 
 > **⚠ Python 特征的缓存失效盲区**：框架只看**被装饰函数自身的源码**和 `version`。如果函数调用了别处的辅助函数，或用到外部定义的阈值（如 `BIG = 1e5`），改了它们框架看不出来，会**静默沿用旧缓存**，回测照常跑完、不报错。**改动这类外部逻辑后，把 `version` 加 1**，或者把阈值写进函数内部。`sql=` / `query=` 特征不受影响（整段 SQL 文本参与判断）。
 
 ## 算子 `tsbt.ops`
 
-沿用 AlphaForge 的时序算子语义（窗口 `d` 的单位是 bar）：窗口内有效样本少于 `min(d, max(2, ⌈d/2⌉))` 时输出 NaN，NaN 样本跳过，std/cov 用 ddof=1，非有限结果一律转 NaN。各列独立，`(T,)` 与 `(T, N)` 通用。
+沿用 AlphaForge 的时序算子语义（窗口 `d` 的单位是 bar）：窗口内有效样本少于 `min(d, max(2, ⌈d/2⌉))` 时输出 NaN，NaN 和 ±inf 样本跳过，std/cov 用 ddof=1，非有限结果一律转 NaN。窗口可以比样本长；常数窗口的 `ts_zscore / ts_ir / ts_corr` 为 NaN，`ts_covariance` 为 0。各列独立，`(T,)` 与 `(T, N)` 通用。
 
 - 逐元素：`add subtract multiply divide inverse reverse abs sign log exp sqrt power signed_power tanh sigmoid clamp max min round round_down floor ceiling fraction if_else greater greater_equal less less_equal equal not_equal and_ or_ not_ is_nan is_not_nan is_finite nan_mask nan_out to_nan purify left_tail right_tail`
 - 位移 / 填充：`ts_delay ts_delta ts_returns log_diff ts_backfill`

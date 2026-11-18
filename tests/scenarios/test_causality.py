@@ -25,7 +25,7 @@ def _market(root, perturb: bool):
             vol[cut:] = rng.uniform(5, 9, len(vol) - cut)
         mk.klines(sym, "2024-01-01", close, volume=vol)
         stamps = t0 + np.arange(0, 4 * DAY, 300_000)
-        oi = 1000 + np.arange(len(stamps), dtype=float) * (1 + i)
+        oi = 1000 + np.cumsum(np.random.default_rng(50 + i).normal(0, 1, len(stamps)))
         if perturb:
             oi[stamps >= t0 + 2 * DAY] *= 3
         mk.metrics(sym, stamps, oi)
@@ -93,6 +93,31 @@ def test_allocation_rules_and_listing(env):
     np.testing.assert_allclose(r.alloc[1:][~listed[:-1, 1] & ~listed[1:, 1], 0], 1.0)
     eq = bt.run(sig, d, price="open").portfolio  # static 1/N: half the capital idles before B lists
     np.testing.assert_allclose(eq.position[~listed[:, 1], 0], 0.4)
+    # Portfolio benchmark = buy once and hold: each symbol is bought with its weight in
+    # the first bar it can trade (B lists a day late; its half waits in cash), then
+    # nothing is rebalanced - so the weights drift with prices.
+    P, C = d.exec_price("open"), d.raw("close")
+    a0 = int(np.searchsorted(d.open_ms, eq.open_ms[0]))
+    b0 = int(np.argmax(d.listed[:, 1]))
+    rows = np.arange(a0, d.T)
+
+    def hold(w):
+        leg_a = C[rows, 0] / P[a0, 0]
+        leg_b = np.where(rows >= b0, C[rows, 1] / P[b0, 1], 1.0)
+        return w[0] * leg_a + w[1] * leg_b
+
+    np.testing.assert_allclose(eq.bench, hold([0.5, 0.5]), rtol=1e-12)
+    tilted = bt.run(sig, d, alloc=A.fixed([0.9, 0.1]), price="open").portfolio
+    np.testing.assert_allclose(tilted.bench, hold([0.9, 0.1]), rtol=1e-12)
+    # it never depends on the strategy: a performance-driven allocation is measured
+    # against the plain 1/N basket, whatever the signal did
+    wiggle = sig * np.sin(np.arange(d.T))[:, None]
+    for dyn in (A.rolling_sharpe(8), A.inv_vol(8)):
+        np.testing.assert_array_equal(bt.run(wiggle, d, alloc=dyn, price="open").bench, eq.bench)
+    # and it is the same number under simple interest (nothing is ever re-invested)
+    np.testing.assert_allclose(
+        bt.run(sig, d, price="open", compound=False).bench, eq.bench, rtol=1e-12
+    )
 
     rng = np.random.default_rng(3)
     ret = rng.normal(0, 0.01, (200, 3))
@@ -117,3 +142,8 @@ def test_allocation_rules_and_listing(env):
     np.testing.assert_allclose(w1[:9], 1 / 3)  # warm-up (< min_valid(20)=10 samples) -> equal
     tot = w1.sum(axis=1)
     assert np.all((np.abs(tot - 1) < 1e-12) | (tot == 0))
+    # inverse volatility: a column with 4x the volatility gets a quarter of the weight
+    scaled = ret * np.array([1.0, 2.0, 4.0])
+    wv = A.inv_vol(30).weights(ctx_for(scaled))
+    np.testing.assert_allclose(wv[150] * np.array([1.0, 2.0, 4.0]) / (wv[150, 0]), 1.0, rtol=0.35)
+    assert wv[150, 0] > wv[150, 1] > wv[150, 2]

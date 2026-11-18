@@ -56,6 +56,7 @@ register_dataset(
             "count": "BIGINT",
             "taker_buy_volume": "DOUBLE",
             "taker_buy_quote_volume": "DOUBLE",
+            "ignore": "BIGINT",
         },
     )
 )
@@ -146,6 +147,16 @@ def _period_range(y: int, m: int, d: int | None) -> tuple[int, int]:
     return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
 
 
+def file_period(name: str) -> tuple[str, int, int] | None:
+    """(period, start_ms, end_ms) encoded in a source file name, or None."""
+    m = _PERIOD_RE.search(name)
+    if m is None:
+        return None
+    d = m.group(3)
+    start, end = _period_range(int(m.group(1)), int(m.group(2)), int(d) if d else None)
+    return m.group(0)[: -len(".parquet")], start, end
+
+
 def _scan(kind: str, ds: Dataset, symbol: str) -> list[SourceFile]:
     base = config.data_root() / kind / ds.subdir.format(sym=symbol)
     if not base.is_dir():
@@ -155,20 +166,19 @@ def _scan(kind: str, ds: Dataset, symbol: str) -> list[SourceFile]:
         for entry in it:
             if not entry.name.endswith(".parquet"):
                 continue
-            m = _PERIOD_RE.search(entry.name)
-            if m is None:
+            parsed = file_period(entry.name)
+            if parsed is None:
                 continue
-            y, mo, d = int(m.group(1)), int(m.group(2)), m.group(3)
-            if (kind == "monthly") != (d is None):
+            period, start, end = parsed
+            if (kind == "monthly") != (len(period) == 7):  # YYYY-MM vs YYYY-MM-DD
                 continue
-            start, end = _period_range(y, mo, int(d) if d else None)
             st = entry.stat()
             out.append(
                 SourceFile(
                     path=entry.path,
                     name=entry.name,
                     kind=kind,
-                    period=m.group(0)[: -len(".parquet")],
+                    period=period,
                     start_ms=start,
                     end_ms=end,
                     size=st.st_size,

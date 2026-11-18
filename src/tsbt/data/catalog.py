@@ -74,13 +74,18 @@ def builders_for(names) -> list:
     return out
 
 
+def minute_price(qv: np.ndarray, v: np.ndarray, close: np.ndarray) -> np.ndarray:
+    """A minute's traded price: its VWAP, or its close when nothing traded."""
+    with np.errstate(invalid="ignore", divide="ignore"):
+        px = qv / v
+    return np.where((v > 0) & np.isfinite(px), px, close)
+
+
 def minute_values(symbol: str, name: str, start_ms: int, end_ms: int) -> np.ndarray:
     """Minute-level values of a builtin / feature field over [start_ms, end_ms)."""
     if name in ("vwap", "twap"):
         qv = m1.read_minutes(symbol, "quote_volume", start_ms, end_ms)
         v = m1.read_minutes(symbol, "volume", start_ms, end_ms)
         c = m1.read_minutes(symbol, "close", start_ms, end_ms)
-        with np.errstate(invalid="ignore", divide="ignore"):
-            px = qv / v
-        return np.where((v > 0) & np.isfinite(px), px, c)
+        return minute_price(qv, v, c)
     return m1.read_minutes(symbol, name, start_ms, end_ms)

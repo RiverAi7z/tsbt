@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
 
@@ -14,8 +14,6 @@ import polars as pl
 
 from tsbt import metrics as M
 from tsbt.config import DAY_MS
-
-KEY_METRICS = ["apr", "sharpe", "calmar", "turnover", "mdd", "start", "end", "days"]
 
 
 def _iso(ms: int) -> str:
@@ -53,7 +51,6 @@ class Result:
     alloc: np.ndarray | None = None
     turnover_cols: np.ndarray | None = None
     pnl_cols: np.ndarray | None = None
-    _plots: dict = field(default_factory=dict, repr=False)
 
     # ------------------------------------------------------------------ time axes
     @property
@@ -133,6 +130,7 @@ class Result:
             "nav": self.nav,
             "nav_gross": self.nav_gross,
             "benchmark": self.bench,
+            "ret": M.period_returns(self._path(self.nav)[1], self.compound),
             "turnover": self.turnover,
             "fee": self.fee_paid,
             "long_pnl": self.long_pnl,
@@ -313,6 +311,8 @@ class PortfolioResult:
 
     def __getattr__(self, name):
         # delegate nav / metrics / series / ... to the portfolio account
+        if name in ("portfolio", "components") or name.startswith("__"):
+            raise AttributeError(name)  # not set yet (unpickling / copying): no recursion
         return getattr(self.portfolio, name)
 
     def __repr__(self) -> str:

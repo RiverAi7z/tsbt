@@ -29,7 +29,7 @@ _COMPRESSOR = zarr.codecs.ZstdCodec(level=3)
 _ROOTS: dict[str, zarr.Group] = {}
 
 
-def root(mode: str = "a") -> zarr.Group:
+def root() -> zarr.Group:
     path = str(config.store_path())
     g = _ROOTS.get(path)
     if g is None:
@@ -50,7 +50,7 @@ def symbol_lock(symbol: str, timeout: float = 3600) -> Iterator[None]:
 
 
 def group(path: str, create: bool = True) -> zarr.Group | None:
-    r = root("a")
+    r = root()
     if create:
         return r.require_group(path)
     try:
@@ -62,7 +62,7 @@ def group(path: str, create: bool = True) -> zarr.Group | None:
 
 def has_array(path: str) -> bool:
     try:
-        node = root("a")[path]
+        node = root()[path]
     except KeyError:
         return False
     return isinstance(node, zarr.Array)
@@ -72,7 +72,7 @@ def read(path: str, lo: int, hi: int) -> np.ndarray:
     """Values at indices [lo, hi); NaN outside the stored extent or when absent."""
     out = np.full(hi - lo, np.nan)
     try:
-        arr = root("a")[path]
+        arr = root()[path]
     except KeyError:
         return out
     n = arr.shape[0]
@@ -82,13 +82,21 @@ def read(path: str, lo: int, hi: int) -> np.ndarray:
     return out
 
 
+def size(path: str) -> int:
+    """Stored length of an array (0 when absent)."""
+    try:
+        return int(root()[path].shape[0])
+    except KeyError:
+        return 0
+
+
 def write(path: str, lo: int, values: np.ndarray) -> None:
     """Write ``values`` at indices [lo, lo+len); creates / grows the array as needed."""
     if lo < 0:
         values = values[-lo:]
         lo = 0
     hi = lo + len(values)
-    r = root("a")
+    r = root()
     try:
         arr = r[path]
     except KeyError:
@@ -106,7 +114,7 @@ def write(path: str, lo: int, values: np.ndarray) -> None:
 
 
 def delete(path: str) -> None:
-    r = root("a")
+    r = root()
     with contextlib.suppress(KeyError):
         del r[path]
 

@@ -120,8 +120,8 @@ def fig_nav(res, log: bool | None = None):
     _, gross = res._path(res.nav_gross)
     _, bench = res._path(res.bench)
     fig, (ax, axd) = _fig(2, (3, 1), _title(res))
-    bench_label = res.symbols[0] if len(res.symbols) == 1 else "benchmark (alloc × hold)"
-    ax.plot(t, bench, color=MUTED, linewidth=1.3, label=f"{bench_label} hold")
+    bench_label = f"{res.symbols[0]} hold" if len(res.symbols) == 1 else "buy & hold basket"
+    ax.plot(t, bench, color=MUTED, linewidth=1.3, label=bench_label)
     ax.plot(t, gross, color=ORANGE, linewidth=1.3, label="gross (before fee)")
     ax.plot(t, nav, color=BLUE, linewidth=1.8, label="net (after fee)")
     if log is None:
@@ -166,7 +166,7 @@ def fig_position(res):
     else:
         tt, bench = res._path(res.bench)
         axp.plot(tt.astype("datetime64[ms]"), bench, color=MUTED, linewidth=1.2)
-        _style(axp, "benchmark NAV (alloc × hold)")
+        _style(axp, "buy & hold basket NAV")
     net = res.position.sum(axis=1)
     dts, dnet = _daily_mean(res, net)
     unit = "equity" if res.compound else "principal"
@@ -309,21 +309,37 @@ _FIGS = {
 }
 
 
+class Figures(dict):
+    """The report figures by name. Ending a notebook cell with it shows all of them
+    (a plain dict would only print its repr)."""
+
+    def _ipython_display_(self):
+        from IPython.display import display
+
+        for fig in self.values():
+            display(fig)
+
+
+def _build(res, kind: str, **kw):
+    fig = _FIGS[kind](res, **kw)
+    # Take it out of pyplot's global registry so repeated calls do not pile up figures;
+    # the object itself still renders in a notebook and can be saved.
+    _plt().close(fig)
+    return fig
+
+
 def plot(res, kind: str | None = None, **kw):
     if kind is None:
-        return {k: _FIGS[k](res) for k in KINDS}
+        return Figures((k, _build(res, k)) for k in KINDS)
     if kind not in _FIGS:
         raise ValueError(f"kind must be one of {KINDS}")
-    return _FIGS[kind](res, **kw)
+    return _build(res, kind, **kw)
 
 
 def save_all(res, out: Path) -> list[Path]:
-    plt = _plt()
     paths = []
     for k in KINDS:
-        fig = _FIGS[k](res)
         p = Path(out) / f"{k}.png"
-        fig.savefig(str(p), dpi=_DPI, facecolor=SURFACE)
-        plt.close(fig)
+        _build(res, k).savefig(str(p), dpi=_DPI, facecolor=SURFACE)
         paths.append(p)
     return paths

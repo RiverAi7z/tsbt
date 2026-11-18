@@ -78,10 +78,6 @@ class _Fields:
         except KeyError as e:
             raise AttributeError(str(e)) from None
 
-    @property
-    def loaded(self) -> list[str]:
-        return list(self._cache)
-
 
 def _ensure(sym: str, names, workers: int, done: set, meta: dict | None = None) -> None:
     todo = [b for b in catalog.builders_for(names) if (sym, b.key) not in done]
@@ -125,7 +121,6 @@ class BarData(_Fields):
         self.offset = offset
         self.freq = bars.freq_label(k)
         self._jlo, self._jhi = jlo, jhi
-        self._ranges = ranges  # per symbol [j0, j1)
         self._workers = workers
         self._m1: M1View | None = None
         self._done: set = set()
@@ -226,7 +221,11 @@ class BarData(_Fields):
 
     # ------------------------------------------------------------------ user fields
     def save_field(self, name: str, values, overwrite: bool = False) -> None:
-        """Cache a bar-level array under ``name`` for this frequency (per symbol)."""
+        """Cache a bar-level array under ``name`` for this frequency (per symbol).
+
+        ``overwrite=True`` replaces the saved field entirely: values previously saved
+        outside this object's time range are dropped, so two versions never mix.
+        """
         if catalog.spec_for(name) is not None:
             raise ValueError(f"{name!r} is a builtin/feature field name")
         v = np.asarray(values, dtype=np.float64)
@@ -320,8 +319,11 @@ def load(
     for sym in syms:
         _ensure(sym, names, workers, done, meta)
         ranges.append(bars.symbol_bar_range(sym, k, offset, meta))
-    jlo = min(a for a, _ in ranges)
-    jhi = max(b for _, b in ranges)
+    live = [(a, b) for a, b in ranges if b > a]  # a symbol may not span one full bar
+    if not live:
+        raise ValueError("no complete bars in the requested range")
+    jlo = min(a for a, _ in live)
+    jhi = max(b for _, b in live)
     F = k * MIN
     base = config.ORIGIN_MS + offset * MIN
     if (s := to_ms(start)) is not None:

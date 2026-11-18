@@ -44,7 +44,6 @@ def simulate(
     theta: np.ndarray, R: np.ndarray, b: np.ndarray, fee: float, compound: bool, pooled: bool
 ) -> SimOut:
     theta = np.asarray(theta, dtype=np.float64)
-    T = theta.shape[0]
 
     def S(x):
         return x.sum(axis=1, keepdims=True) if pooled else x
@@ -54,16 +53,17 @@ def simulate(
     prev = np.zeros_like(theta)
     if compound:
         G = 1.0 + S(tR)
-        with np.errstate(divide="ignore", invalid="ignore"):
+        # Rows after a bankruptcy can overflow; they are overwritten below.
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
             prev[1:] = theta[:-1] * (1.0 + R[:-1]) / G[:-1]
-        tau_cols = np.abs(theta - prev)
-        tau = S(tau_cols)
-        c = 1.0 - fee * tau
-        growth = np.ones_like(G)
-        growth[1:] = np.cumprod(G[:-1], axis=0)
-        e_plus = np.cumprod(c, axis=0) * growth
-        nav = e_plus * (1.0 + mark)
-        fee_paid = fee * tau * np.divide(e_plus, c, out=np.zeros_like(e_plus), where=c > 0)
+            tau_cols = np.abs(theta - prev)
+            tau = S(tau_cols)
+            c = 1.0 - fee * tau
+            growth = np.ones_like(G)
+            growth[1:] = np.cumprod(G[:-1], axis=0)
+            e_plus = np.cumprod(c, axis=0) * growth
+            nav = e_plus * (1.0 + mark)
+            fee_paid = fee * tau * np.divide(e_plus, c, out=np.zeros_like(e_plus), where=c > 0)
         # bankruptcy: equity <= 0 at a trade, at a bar close, or between two trades
         bad = (c <= 0) | (1.0 + mark <= 0)
         bad[1:] |= G[:-1] <= 0
@@ -88,5 +88,4 @@ def simulate(
         nav = 1.0 + realized - fee * np.cumsum(tau, axis=0) + mark
         fee_paid = fee * tau
         first = np.full(nav.shape[1], -1)
-    assert nav.shape[0] == T
     return SimOut(nav=nav, turnover=tau, turnover_cols=tau_cols, fee=fee_paid, bankrupt_at=first)

@@ -38,10 +38,9 @@ import duckdb
 import numpy as np
 import polars as pl
 
+from tsbt.config import MINUTE_MS as MIN
 from tsbt.data import sources
 from tsbt.data.sources import SourceFile
-
-MIN = 60_000
 
 
 @dataclass
@@ -82,12 +81,13 @@ def _src(path: str) -> str:
 
 def _duck(threads: int) -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
-    con.execute(f"SET threads={max(1, threads)}")
+    threads = min(max(1, threads), os.cpu_count() or 1)
+    con.execute(f"SET threads={threads}")
     try:
-        total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-        con.execute(
-            f"SET memory_limit='{max(2, int(total * 0.5 / 2**30 / max(1, 24 // threads)))}GB'"
-        )
+        # half of the RAM, shared by as many connections as the CPUs can run at once
+        total_gb = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30
+        concurrent = max(1, (os.cpu_count() or 1) // threads)
+        con.execute(f"SET memory_limit='{max(2, int(total_gb * 0.5 / concurrent))}GB'")
     except (ValueError, OSError):
         pass
     con.execute("SET preserve_insertion_order=false")
@@ -159,6 +159,7 @@ class FeatureSet:
             def_hash=self.def_hash,
             fill=dict(self.fill),
             strict=True,
+            threads=self.threads,
         )
 
 
@@ -209,6 +210,8 @@ def feature_set(
 
     def _register(fn=None) -> FeatureSet:
         if sql is not None:
+            if outputs is not None and list(outputs) != list(sql):
+                raise ValueError(f"feature set {name!r}: with sql= the outputs are the sql keys")
             outs = list(sql)
         elif query is not None:
             outs = list(outputs) if outputs else _infer_query_outputs(source, query)
@@ -218,6 +221,7 @@ def feature_set(
                 raise ValueError(
                     f"feature set {name!r}: a Python feature needs outputs=[...] (or bar_agg keys)"
                 )
+        _check_options(name, outs, bar_agg or {}, fill or {})
         fs = FeatureSet(
             name=name,
             source=source,
@@ -237,6 +241,23 @@ def feature_set(
     if sql is None and query is None:
         return _register
     return _register()
+
+
+def _check_options(name: str, outs: list[str], bar_agg: dict, fill: dict) -> None:
+    """A misspelt key would silently fall back to the default rule / NaN fill."""
+    from tsbt.data.bars import REDUCERS
+
+    for label, opts in (("bar_agg", bar_agg), ("fill", fill)):
+        unknown = sorted(set(opts) - set(outs))
+        if unknown:
+            raise ValueError(
+                f"feature set {name!r}: {label} names {unknown} are not outputs {outs}"
+            )
+    for out, rule in bar_agg.items():
+        if rule not in REDUCERS:
+            raise ValueError(
+                f"feature set {name!r}: bar_agg[{out!r}]={rule!r} is not one of {sorted(REDUCERS)}"
+            )
 
 
 def _check_names(fs: FeatureSet) -> None:
@@ -259,7 +280,3 @@ def feature_for_field(fld: str) -> FeatureSet | None:
 
 def feature_fields() -> dict[str, str]:
     return {o: fs.name for fs in FEATURES.values() for o in fs.outputs}
-
-
-def unregister(name: str) -> None:
-    FEATURES.pop(name, None)

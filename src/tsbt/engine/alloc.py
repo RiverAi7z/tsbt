@@ -53,7 +53,11 @@ class AllocContext:
 class Alloc:
     """Base class: subclasses implement ``raw(ctx)``; options handled here."""
 
+    #: static weights are used for every bar, listed or not (idle capital stays idle)
     static = False
+    #: user callables are taken as they are: NaN means "no allocation", never a fallback
+    as_is = False
+    name = "alloc"
 
     def __init__(self, normalize: bool = True, rebalance_every: int | None = None):
         self.normalize = normalize
@@ -62,11 +66,26 @@ class Alloc:
     def raw(self, ctx: AllocContext) -> np.ndarray:  # (T, N), NaN = warm-up
         raise NotImplementedError
 
+    def _params(self) -> dict:
+        return {}
+
+    def __repr__(self) -> str:
+        args = {
+            **self._params(),
+            "normalize": self.normalize,
+            "rebalance_every": self.rebalance_every,
+        }
+        shown = ", ".join(f"{k}={v!r}" for k, v in args.items() if v is not None)
+        return f"{self.name}({shown})"
+
     def weights(self, ctx: AllocContext) -> np.ndarray:
         w = np.asarray(self.raw(ctx), dtype=np.float64)
         T, N = ctx.listed.shape
         w = np.broadcast_to(w, (T, N)).copy()
-        if not self.static:
+        w[~np.isfinite(w)] = np.nan
+        if self.static or self.as_is:
+            w = np.nan_to_num(w, nan=0.0)
+        else:
             w[~ctx.listed] = np.nan
             # NaN = not enough history. A row where no listed symbol has a weight yet
             # falls back to equal weights among listed symbols; otherwise NaN -> 0.
@@ -90,6 +109,10 @@ class _Static(Alloc):
     def __init__(self, w=None, **kw):
         super().__init__(**kw)
         self.w = w
+        self.name = "equal" if w is None else "fixed"
+
+    def _params(self):
+        return {} if self.w is None else {"w": np.asarray(self.w, dtype=np.float64).tolist()}
 
     def raw(self, ctx):
         N = ctx.listed.shape[1]
@@ -112,6 +135,8 @@ def fixed(w, normalize: bool = True, **kw) -> Alloc:
 
 
 class _EqualActive(Alloc):
+    name = "equal_active"
+
     def raw(self, ctx):
         return np.ones(ctx.listed.shape)
 
@@ -122,9 +147,14 @@ def equal_active(**kw) -> Alloc:
 
 
 class _InvVol(Alloc):
+    name = "inv_vol"
+
     def __init__(self, window, **kw):
         super().__init__(**kw)
         self.window = int(window)
+
+    def _params(self):
+        return {"window": self.window}
 
     def raw(self, ctx):
         sd = ts_std_dev(ctx.ret, self.window)
@@ -139,10 +169,15 @@ def inv_vol(window: int, **kw) -> Alloc:
 
 
 class _Sharpe(Alloc):
+    name = "rolling_sharpe"
+
     def __init__(self, window, floor=0.0, **kw):
         super().__init__(**kw)
         self.window = int(window)
         self.floor = float(floor)
+
+    def _params(self):
+        return {"window": self.window, "floor": self.floor}
 
     def raw(self, ctx):
         r = ctx.ret
@@ -161,16 +196,26 @@ def rolling_sharpe(window: int, floor: float = 0.0, **kw) -> Alloc:
 
 
 class _Callable(Alloc):
+    as_is = True
+    name = "custom"
+
     def __init__(self, fn, **kw):
         super().__init__(**kw)
         self.fn = fn
+
+    def _params(self):
+        return {"fn": getattr(self.fn, "__name__", type(self.fn).__name__)}
 
     def raw(self, ctx):
         return self.fn(ctx)
 
 
 def custom(fn: Callable[[AllocContext], np.ndarray], normalize: bool = False, **kw) -> Alloc:
-    """Wrap a callable; by default its output is used as is."""
+    """Wrap a callable so ``normalize`` / ``rebalance_every`` can be applied to it.
+
+    Its output is otherwise used as is, exactly like passing the callable directly:
+    NaN (and weights of unlisted symbols) mean "no allocation".
+    """
     return _Callable(fn, normalize=normalize, **kw)
 
 
@@ -188,4 +233,34 @@ def resolve(alloc, ctx: AllocContext) -> np.ndarray:
             w = np.broadcast_to(w, (T, N))
     if w.shape != (T, N):
         raise ValueError(f"allocation must be ({T}, {N}), got {w.shape}")
-    return np.nan_to_num(np.asarray(w, dtype=np.float64), nan=0.0)
+    return np.where(np.isfinite(w), w, 0.0)  # NaN / inf -> no allocation
+
+
+def benchmark_weights(alloc, ctx: AllocContext) -> np.ndarray:
+    """``(N,)`` initial weights of the buy-and-hold benchmark basket.
+
+    A static allocation supplies its own weights. Anything time-varying (rolling
+    Sharpe, inverse vol, arrays, callables) may depend on how the strategy performed,
+    so the benchmark uses a plain 1/N basket instead.
+    """
+    N = ctx.listed.shape[1]
+    if alloc is None:
+        alloc = equal()
+    if isinstance(alloc, Alloc) and alloc.static:
+        return alloc.weights(ctx)[0]
+    if not isinstance(alloc, Alloc) and not callable(alloc):
+        w = np.asarray(alloc, dtype=np.float64)
+        if w.shape == (N,):
+            return np.where(np.isfinite(w), w, 0.0)
+    return np.full(N, 1.0 / N)
+
+
+def describe(alloc) -> str:
+    """Short text recorded in the result config."""
+    if alloc is None:
+        return repr(equal())
+    if isinstance(alloc, Alloc):
+        return repr(alloc)
+    if callable(alloc):
+        return f"callable({getattr(alloc, '__name__', type(alloc).__name__)})"
+    return f"array{np.shape(alloc)}"

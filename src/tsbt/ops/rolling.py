@@ -63,43 +63,122 @@ def ts_backfill(x, d: int):
 # --------------------------------------------------------------------------- bottleneck
 
 
-def _bn(fn):
+def _move(fn, a, d: int, **kw):
+    """Call a bottleneck ``move_*`` on a window that may be longer than the sample.
+
+    bottleneck refuses ``window > len``; head windows are simply truncated in our
+    semantics, so pad the top with NaN rows and strip them again.
+    """
+    t_len = a.shape[0]
+    if t_len == 0:
+        return np.empty_like(a, dtype=np.float64)
+    if d <= t_len:
+        return fn(a, window=d, axis=0, **kw)
+    pad = np.full((d - t_len, *a.shape[1:]), np.nan)
+    return fn(np.concatenate([pad, a], axis=0), window=d, axis=0, **kw)[d - t_len :]
+
+
+def _finite(a):
+    """Non-finite samples count as missing (bottleneck only skips NaN)."""
+    bad = ~np.isfinite(a)
+    return np.where(bad, np.nan, a) if bad.any() else a
+
+
+def _bn(name: str, doc: str, fn):
     def op(x, d: int):
         d = check_d(d)
-        return ts_op(lambda a: fn(a, d, min_valid(d)))(x)
+        return ts_op(lambda a: fn(_finite(a), d, min_valid(d)))(x)
 
-    op.__name__ = fn.__name__
+    op.__name__ = op.__qualname__ = name
+    op.__doc__ = doc
     return op
 
 
-ts_sum = _bn(lambda a, d, mc: bn.move_sum(a, window=d, min_count=mc, axis=0))
-ts_sum.__name__ = "ts_sum"
-ts_mean = _bn(lambda a, d, mc: bn.move_mean(a, window=d, min_count=mc, axis=0))
-ts_mean.__name__ = "ts_mean"
-ts_min = _bn(lambda a, d, mc: bn.move_min(a, window=d, min_count=mc, axis=0))
-ts_min.__name__ = "ts_min"
-ts_max = _bn(lambda a, d, mc: bn.move_max(a, window=d, min_count=mc, axis=0))
-ts_max.__name__ = "ts_max"
-ts_median = _bn(lambda a, d, mc: bn.move_median(a, window=d, min_count=mc, axis=0))
-ts_median.__name__ = "ts_median"
+ts_sum = _bn(
+    "ts_sum",
+    "Rolling sum of the valid samples.",
+    lambda a, d, mc: _move(bn.move_sum, a, d, min_count=mc),
+)
+ts_mean = _bn(
+    "ts_mean",
+    "Rolling mean of the valid samples.",
+    lambda a, d, mc: _move(bn.move_mean, a, d, min_count=mc),
+)
+ts_min = _bn(
+    "ts_min",
+    "Rolling minimum of the valid samples.",
+    lambda a, d, mc: _move(bn.move_min, a, d, min_count=mc),
+)
+ts_max = _bn(
+    "ts_max",
+    "Rolling maximum of the valid samples.",
+    lambda a, d, mc: _move(bn.move_max, a, d, min_count=mc),
+)
+ts_median = _bn(
+    "ts_median",
+    "Rolling median of the valid samples.",
+    lambda a, d, mc: _move(bn.move_median, a, d, min_count=mc),
+)
+
+#: a window whose bottleneck std is below this fraction of its largest |value| is
+#: recomputed exactly: the sliding update of bottleneck leaves a residual of about
+#: sqrt(eps) * scale, which turns a constant window into a tiny non-zero std.
+_STD_EXACT_BELOW = 1e-3
+
+
+#: an exactly recomputed std below this fraction of the window's largest |value| is
+#: pure rounding of a constant window -> exactly 0 (so zscore / ir become NaN).
+_STD_ZERO_BELOW = 1e-12
+
+
+@nb.njit(cache=True)
+def _std_exact_rows(x, d, out, suspect, scale, zero_below):
+    t_len, n = x.shape
+    for j in range(n):
+        for t in range(t_len):
+            if not suspect[t, j]:
+                continue
+            lo = max(0, t - d + 1)
+            c = 0
+            s = 0.0
+            for u in range(lo, t + 1):
+                v = x[u, j]
+                if np.isfinite(v):
+                    c += 1
+                    s += v
+            mean = s / c
+            ss = 0.0
+            for u in range(lo, t + 1):
+                v = x[u, j]
+                if np.isfinite(v):
+                    ss += (v - mean) ** 2
+            sd = math.sqrt(ss / (c - 1))
+            out[t, j] = sd if sd > zero_below * scale[t, j] else 0.0
 
 
 def _std(a, d, mc):
     if d < 2:
         return np.full_like(a, np.nan)
-    return bn.move_std(a, window=d, min_count=max(mc, 2), axis=0, ddof=1)
+    out = _move(bn.move_std, a, d, min_count=max(mc, 2), ddof=1)
+    scale = _move(bn.move_max, np.abs(a), d, min_count=1)
+    with np.errstate(invalid="ignore"):
+        suspect = np.isfinite(out) & (out < _STD_EXACT_BELOW * scale)
+    if suspect.any():
+        _std_exact_rows(np.ascontiguousarray(a), d, out, suspect, scale, _STD_ZERO_BELOW)
+    return out
 
 
-ts_std_dev = _bn(_std)
-ts_std_dev.__name__ = "ts_std_dev"
+ts_std_dev = _bn(
+    "ts_std_dev", "Rolling sample standard deviation (ddof=1); needs >= 2 valid samples.", _std
+)
 
 
 def _valid_count(a, d):
-    return bn.move_sum(np.isfinite(a).astype(np.float64), window=d, min_count=1, axis=0)
+    return _move(bn.move_sum, np.isfinite(a).astype(np.float64), d, min_count=1)
 
 
 def _rank(a, d, mc):
-    r = bn.move_rank(a, window=d, min_count=1, axis=0)
+    r = _move(bn.move_rank, a, d, min_count=1)
     out = (r + 1.0) / 2.0
     cnt = _valid_count(a, d)
     out[(cnt == 1) & np.isfinite(a)] = 0.5
@@ -107,8 +186,9 @@ def _rank(a, d, mc):
     return out
 
 
-ts_rank = _bn(_rank)
-ts_rank.__name__ = "ts_rank"
+ts_rank = _bn(
+    "ts_rank", "Rank of today's value within the window, scaled to [0, 1] (ties averaged).", _rank
+)
 
 
 def ts_zscore(x, d: int):
@@ -178,7 +258,10 @@ def _moments_nb(x, d, k):
                 if np.isfinite(v):
                     dv = v - mean
                     a2 += dv * dv
-                    ak += dv**k
+                    p = dv
+                    for _ in range(k - 1):
+                        p *= dv
+                    ak += p
             m2[t, j] = a2 / c
             mk[t, j] = ak / c
     return cnt, m2, mk
@@ -195,7 +278,7 @@ def ts_skewness(x, d: int):
     d = check_d(d)
 
     def k(a):
-        cnt, m2, m3 = _moments_nb(a, d, 3.0)
+        cnt, m2, m3 = _moments_nb(a, d, 3)
         with np.errstate(all="ignore"):
             return _gate(m3 / m2**1.5, cnt, max(min_valid(d), 3))
 
@@ -207,7 +290,7 @@ def ts_kurtosis(x, d: int):
     d = check_d(d)
 
     def k(a):
-        cnt, m2, m4 = _moments_nb(a, d, 4.0)
+        cnt, m2, m4 = _moments_nb(a, d, 4)
         with np.errstate(all="ignore"):
             return _gate(m4 / m2**2 - 3.0, cnt, max(min_valid(d), 4))
 
@@ -217,9 +300,12 @@ def ts_kurtosis(x, d: int):
 def ts_moment(x, d: int, k: int):
     """k-th population central moment (not standardised)."""
     d = check_d(d)
+    if int(k) != k or k < 1:
+        raise ValueError(f"moment order k must be a positive integer, got {k}")
+    k = int(k)
 
     def kern(a):
-        cnt, _, mk = _moments_nb(a, d, float(k))
+        cnt, _, mk = _moments_nb(a, d, k)
         return _gate(mk, cnt, min_valid(d))
 
     return ts_op(kern)(x)
@@ -389,7 +475,10 @@ def _quantile_nb(x, d, driver):
 def ts_quantile(x, d: int, driver: str = "gaussian"):
     """p = #(window <= today) / (valid + 1), mapped by gaussian / uniform / cauchy."""
     d = check_d(d)
-    code = {"gaussian": 0, "uniform": 1, "cauchy": 2}[driver]
+    codes = {"gaussian": 0, "uniform": 1, "cauchy": 2}
+    if driver not in codes:
+        raise ValueError(f"driver must be one of {sorted(codes)}, got {driver!r}")
+    code = codes[driver]
 
     def k(a):
         cnt, out = _quantile_nb(a, d, code)
@@ -529,7 +618,7 @@ def _pair_sums(x, y, d):
     yv = np.where(v, y, 0.0)
 
     def ms(a):
-        return bn.move_sum(a, window=d, min_count=1, axis=0)
+        return _move(bn.move_sum, a, d, min_count=1)
 
     return {
         "n": ms(v.astype(np.float64)),
@@ -541,16 +630,33 @@ def _pair_sums(x, y, d):
     }
 
 
+#: a variance below this fraction of the window's sum of squares is rounding noise of
+#: the sliding sums (a constant window), not a real variance -> treated as zero.
+_VAR_EPS = 1e-11
+
+
+def _var_sum(sxx, sx, n):
+    """Sum of squared deviations from sliding sums, with rounding noise clamped to 0."""
+    v = sxx - sx**2 / n
+    return np.where(v > _VAR_EPS * sxx, v, 0.0)
+
+
 def ts_covariance(x, y, d: int):
-    """Sample covariance (ddof=1) over pairwise-valid samples."""
+    """Sample covariance (ddof=1) over pairwise-valid samples.
+
+    Exactly 0 when either series does not move inside the window (the sliding sums
+    would otherwise leave a tiny residual of random sign).
+    """
     d = check_d(d)
 
     def k(a, b):
         s = _pair_sums(a, b, d)
         n = s["n"]
+        nn = np.maximum(n, 1)
         with np.errstate(all="ignore"):
-            cov = (s["xy"] - s["x"] * s["y"] / np.maximum(n, 1)) / np.maximum(n - 1, 1)
-        return _gate(cov, n, max(min_valid(d), 2))
+            cov = (s["xy"] - s["x"] * s["y"] / nn) / np.maximum(n - 1, 1)
+            flat = (_var_sum(s["xx"], s["x"], nn) == 0) | (_var_sum(s["yy"], s["y"], nn) == 0)
+        return _gate(np.where(flat, 0.0, cov), n, max(min_valid(d), 2))
 
     return ts_op2(k)(x, y)
 
@@ -564,9 +670,8 @@ def ts_corr(x, y, d: int):
         n = np.maximum(s["n"], 1)
         with np.errstate(all="ignore"):
             cov = s["xy"] - s["x"] * s["y"] / n
-            vx = s["xx"] - s["x"] ** 2 / n
-            vy = s["yy"] - s["y"] ** 2 / n
-            rho = np.clip(cov / np.sqrt(vx * vy), -1.0, 1.0)
+            den = np.sqrt(_var_sum(s["xx"], s["x"], n) * _var_sum(s["yy"], s["y"], n))
+            rho = np.where(den > 0, np.clip(cov / den, -1.0, 1.0), np.nan)
         return _gate(rho, s["n"], max(min_valid(d), 2))
 
     return ts_op2(k)(x, y)
@@ -576,7 +681,7 @@ def _regression(y, x, d, rettype):
     s = _pair_sums(x, y, d)
     n = np.maximum(s["n"], 1)
     with np.errstate(all="ignore"):
-        beta = (s["xy"] - s["x"] * s["y"] / n) / (s["xx"] - s["x"] ** 2 / n)
+        beta = (s["xy"] - s["x"] * s["y"] / n) / _var_sum(s["xx"], s["x"], n)
         alpha = s["y"] / n - beta * s["x"] / n
         if rettype == 1:
             out = alpha

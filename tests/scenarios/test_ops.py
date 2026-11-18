@@ -158,16 +158,64 @@ def test_operators_match_alphaforge_reference_kernels():
         ),
         "ts_backfill": (op.ts_backfill(x, 4), k6.k_ts_backfill((x,), {"d": 4}, None)),
     }
-    try:
-        import scipy  # noqa: F401
-
-        ref["ts_quantile"] = (
-            op.ts_quantile(x, 15),
-            k3._ts_quantile_numpy(x, 15, "gaussian", mv(15)),
-        )
-    except ImportError:
-        pass
     for name, (ours, theirs) in ref.items():
         np.testing.assert_allclose(
             ours, theirs, rtol=1e-9, atol=1e-10, equal_nan=True, err_msg=name
         )
+
+
+def test_quantile_drivers_against_a_naive_count():
+    """p = #(window <= today) / (valid + 1); gaussian is the normal quantile of p."""
+    from statistics import NormalDist
+
+    x = _panel(seed=6)[:, 0]
+    d = 15
+    p = op.ts_quantile(x, d, "uniform")
+    g = op.ts_quantile(x, d, "gaussian")
+    for t in range(len(x)):
+        w = x[max(0, t - d + 1) : t + 1]
+        w = w[np.isfinite(w)]
+        if not np.isfinite(x[t]) or len(w) < op.min_valid(d):
+            assert np.isnan(p[t]) and np.isnan(g[t])
+            continue
+        want = (w <= x[t]).sum() / (len(w) + 1)
+        assert p[t] == pytest.approx(want, rel=1e-12)
+        assert g[t] == pytest.approx(NormalDist().inv_cdf(want), abs=1e-9)
+    with pytest.raises(ValueError, match="driver"):
+        op.ts_quantile(x, d, "normal")
+
+
+def test_awkward_inputs_short_samples_inf_and_flat_windows():
+    """Things real data does: fewer bars than the window, an inf from a division, and a
+    stretch where the series does not move after a volatile period."""
+    short = np.arange(6.0) ** 2
+    # windows longer than the sample are just truncated head windows
+    np.testing.assert_allclose(op.ts_mean(short, 10)[4:], [short[:5].mean(), short.mean()])
+    assert np.isnan(op.ts_mean(short, 10)[:4]).all()
+    assert op.ts_zscore(short, 30).shape == short.shape and np.isnan(op.ts_zscore(short, 30)).all()
+    assert np.isfinite(op.ts_corr(short, short[::-1].copy(), 8)[-1])
+    assert op.ts_mean(np.zeros(0), 5).shape == (0,)
+
+    # +-inf is a missing sample, never an output
+    z = np.array([1.0, 2.0, np.inf, 4.0, 5.0, -np.inf, 7.0, 8.0])
+    for f in (op.ts_sum, op.ts_mean, op.ts_max, op.ts_min, op.ts_median, op.ts_std_dev, op.ts_rank):
+        out = f(z, 3)
+        assert not np.isinf(out).any(), f.__name__
+    np.testing.assert_allclose(op.ts_sum(z, 3)[2:5], [3.0, 6.0, 9.0])
+
+    # a flat window has zero dispersion exactly: zscore / ir / corr are undefined, not noise
+    rng = np.random.default_rng(0)
+    flat = np.r_[rng.normal(100_000, 500, 300), np.full(200, 98_765.4321)]
+    tail = slice(320, None)
+    np.testing.assert_array_equal(op.ts_std_dev(flat, 20)[tail], 0.0)
+    assert np.isnan(op.ts_zscore(flat, 20)[tail]).all()
+    assert np.isnan(op.ts_ir(flat, 20)[tail]).all()
+    assert np.isnan(op.ts_corr(flat, rng.normal(size=500), 20)[tail]).all()
+    assert np.isnan(op.ts_regression(rng.normal(size=500), flat, 20, rettype=2)[tail]).all()
+    # covariance with something that does not move is 0 - not a residual of random sign
+    np.testing.assert_array_equal(op.ts_covariance(flat, rng.normal(size=500), 20)[tail], 0.0)
+    assert np.abs(op.ts_covariance(flat, flat * 2, 20)[100]) > 1e4
+    # ... while ordinary windows are untouched by the exact path
+    np.testing.assert_allclose(
+        op.ts_std_dev(flat, 20)[100], np.std(flat[81:101], ddof=1), rtol=1e-9
+    )

@@ -125,14 +125,15 @@
 
 ### 6.1 数据集注册
 
-数据集是一条注册记录：`名称 / 目录模式 / 时间列 / 粒度`。第一版注册 `klines`、`metrics`、`aggTrades`。`trades`、`liquidationSnapshot`、`indexPriceKlines`、`premiumIndexKlines` 目录结构相同，日后加一条注册即可被自定义特征使用。
+数据集是一条注册记录：`名称 / 目录模式 / 时间列 / 粒度`。已注册 `klines`、`metrics`、`aggTrades`、`trades`（字段均与真实文件核对过）。`liquidationSnapshot`、`indexPriceKlines`、`premiumIndexKlines` 目录结构相同，加一条注册即可被自定义特征使用。
 
 **monthly / daily 取舍**：某个月存在 monthly 文件时，该月全部以 monthly 为准；daily 文件只用于没有 monthly 覆盖的日期。合并后按时间键去重（保留最后一条）并排序。
 
 ### 6.2 L1 分钟库
 
 - 路径：`$TSBT_CACHE_DIR/store.zarr/m1/<SYMBOL>/<field>`，1-D `float64`，zstd 压缩，约 50 万点（≈ 1 年）一个 chunk。
-- 组属性：`start_ms`（该标的首根分钟）、`step_ms = 60000`、`n`、各数据集的源文件清单（文件名 / 大小 / mtime）与构建器版本。
+- 所有数组共用一个全局起点（2019-01-01 UTC，下标 = 距起点的分钟数），读取任意时间段只是一次切片，多标的对齐不需要各自的偏移。
+- 组属性：每个构建器一份清单 `build:<key>`，记录定义哈希、字段、已构建的源文件（文件名 → 大小 / mtime）、数据起止时间和版本号。
 - 网格内缺失的分钟填 `NaN`。
 - **按需、按（标的 × 数据集）懒构建**：`load` 时发现缺失才构建；也可用 CLI 预热。
 
@@ -251,7 +252,7 @@ def custom(chunk: bt.SourceChunk) -> pl.DataFrame:
 - 尾部新增文件 → 增量追加；已有文件发生变化 → 该（标的 × 数据集）重建。
 - 构建期间按标的加文件锁，避免并发写。
 - 缓存位置 `TSBT_CACHE_DIR`（默认 `~/.cache/tsbt`），数据根 `TSBT_DATA_ROOT`（默认 `/share/binance_data/futures/um`）。
-- CLI：`tsbt cache build --symbols ... --freq ... [--workers N]`、`tsbt cache status`、`tsbt cache clear [--symbol ...] [--field ...]`。
+- CLI：`tsbt cache build (--symbols ... | --all) --freq ... [--workers N]`（必须指明标的，全量构建要显式写 `--all`）、`tsbt cache status`、`tsbt cache clear [--symbol ...] [--field ...]`。
 
 ### 6.9 加载 API
 
@@ -282,7 +283,7 @@ bt.fields()                       # 内置字段 + 已注册用户特征
 
 | 类别 | 算子 |
 |---|---|
-| 逐元素 | `add subtract multiply divide inverse reverse abs sign log exp sqrt power signed_power tanh sigmoid clamp max min round floor ceiling fraction if_else greater greater_equal less less_equal equal not_equal and_ or_ not_ is_nan is_not_nan is_finite nan_mask nan_out to_nan purify left_tail right_tail` |
+| 逐元素 | `add subtract multiply divide inverse reverse abs sign log exp sqrt power signed_power tanh sigmoid clamp max min round round_down floor ceiling fraction if_else greater greater_equal less less_equal equal not_equal and_ or_ not_ is_nan is_not_nan is_finite nan_mask nan_out to_nan purify left_tail right_tail` |
 | 位移 / 填充 | `ts_delay ts_delta ts_returns log_diff ts_backfill` |
 | 滚动统计 | `ts_sum ts_mean ts_std_dev ts_min ts_max ts_median ts_rank ts_zscore ts_scale ts_av_diff ts_ir ts_arg_max ts_arg_min ts_product ts_skewness ts_kurtosis ts_moment ts_quantile ts_entropy ts_count_nans inst_tvr` |
 | 加权 / 滤波 | `ts_decay_linear ts_decay_exp_window filter` |
@@ -413,11 +414,12 @@ NAV[t]    = 1 + Σ_{u<t} pnl[u] − f·Σ_{u≤t} τ[u] + Σ_i θ[t,i]·b[t,i]
 
 ### 8.9 基准
 
-基准 = **同一组标的、信号恒为 1、同一资金口径与分配规则、费率 0** 的结果。
+基准是**持有交易标的本身**，且**不依赖策略自身的表现**。单标的沿用“同口径、信号恒为 1、费率 0”；组合用**买入不动**的篮子。
 
 - 单标的复利：恰为买入持有 `C[t] / C[start]`。
 - 单标的单利：标的简单收益的累加，与策略的单利记账口径一致。
-- 组合：按同一 `alloc` 持有一篮子标的。
+- 组合：**买入不动**。每个标的在组合起点（晚上市的在其上市的第一根 bar）按权重买入一次，之后不再调仓，权重随价格漂移；等待上市的份额和权重和不足 1 的部分是现金；数据提前结束的标的按最后一根 bar 的执行价卖出。复利、单利两种口径下数值相同。初始权重：分配是静态的（等权、`fixed`、`(N,)` 数组）时用同一权重；分配随时间变化（滚动 Sharpe、反波动、`(T, N)` 数组、自定义函数）时，权重可能来自策略表现，改用等权 `1/N`。
+- 注意它不是“每根 bar 调回固定权重”的篮子：后者自带再平衡收益（BTC/ETH/SOL 1h、2020-01 起实测，期末 33.2x 对 22.6x），且不是买了放着就能拿到的收益。
 
 ---
 
@@ -457,7 +459,7 @@ NAV[t]    = 1 + Σ_{u<t} pnl[u] − f·Σ_{u≤t} τ[u] + Σ_i θ[t,i]·b[t,i]
 | `rolling_sharpe.png` | 滚动 Sharpe（日频，默认 90 天窗口，可配），附基准的滚动 Sharpe 作参照 |
 
 ```python
-res.plot()                 # 返回 5 张图；notebook 里直接显示
+res.plot()                 # 5 张图的容器；作为 notebook 单元格的最后一行会逐张显示
 res.plot("nav")            # 单张
 res.save("runs/mom_4h")    # 落盘
 ```
@@ -521,11 +523,12 @@ tsbt/
 │   │   ├── features.py       用户特征集（duckdb SQL / Python）
 │   │   ├── bars.py           L2：reshape 归约、执行价、d.agg
 │   │   └── api.py            BarData / load / load_m1
-│   ├── ops/                  elementwise / shift / rolling / recurrence
+│   ├── ops/                  elementwise / rolling（含位移与填充）/ recurrence
 │   ├── engine/
 │   │   ├── core.py           复利 / 单利 × 独立 / 资金池 的闭式核
+│   │   ├── run.py            bt.run：信号 → 仓位 → 盈亏
 │   │   ├── alloc.py          资金分配器
-│   │   └── result.py         Result / PortfolioResult
+│   │   └── result.py         Result / BatchResult / PortfolioResult
 │   ├── metrics.py
 │   ├── plot.py               唯一依赖 xy 的文件
 │   └── cli.py                tsbt cache build / status / clear
@@ -611,3 +614,15 @@ tsbt/
 5. **组合中区间内缺 bar**：该标的目标沿用上一期；共享资金池里其他标的的漂移仍会让它产生很小的再平衡换手（场景测试中 < 1%），这是“目标沿用上一期”的直接结果。
 6. **xy 0.0.9 的限制**：`imshow` 不支持自定义 colormap，热力图颜色在代码中按蓝-灰-红发散色阶计算后以 RGB 图传入；`axhline` 渲染出错，零线用普通线段绘制；`spines.set_color` 不可用。
 7. **图表配色**：费后净值蓝、费前橙、基准中性灰、回撤与负值红；不使用双 y 轴（价格、仓位、换手分面板）。高频仓位在 `position.png` 中以浅色逐 bar 填充 + 日均线表示。
+8. **非有限值**：信号和分配权重里的 `±inf` 与 NaN 一样视为“无信号 / 不分配”，不会被当成巨大仓位。滚动算子把 `±inf` 输入当作缺失样本。
+9. **窗口比样本长**：滚动算子不报错，按截断的头部窗口处理（有效样本达到门槛即出值）。
+10. **零方差**：`ts_std_dev` 在低相对波动的窗口上改用精确的两遍算法（bottleneck 的滑动更新在常数窗口上会留下约 √eps × 量级的残差），纯舍入量级的结果记为 0；`ts_corr` / `ts_regression` 的方差低于平方和的 1e-11 时视为零方差。因此常数窗口上 `ts_zscore`、`ts_ir`、`ts_corr` 输出 NaN 而不是噪声。
+11. **特征集参数校验**：`bar_agg` / `fill` 的键必须是输出列名，`bar_agg` 的值必须是内置单输入归约名；拼错直接报错（否则会静默退回默认的 `last` / NaN）。
+12. **构建中断**：出错或 Ctrl-C 时，已算完的源文件先落盘、排队中的文件不再启动；下次只补未完成的文件。
+13. **`names=`**：给信号列命名；组合模式下用于各标的的独立账户。结果的 `config["alloc"]` 记录分配器及其参数。
+14. **`bt.alloc.custom(f)`** 与直接传 `f` 含义相同（NaN 行不分配），只是多了 `normalize` / `rebalance_every` 选项。
+15. **`save_field(overwrite=True)` 整体替换**已保存的字段：此前保存在当前对象时间范围之外的值会被丢弃，新旧版本不会混在一起。
+16. **特征构建的线程上限**：同时处理的文件数 × 每个文件的 DuckDB 线程数（特征集的 `threads`，默认 4）不超过机器核数；`workers` 超出时自动下调。
+17. **图表对象**：`res.plot()` 返回 `Figures`（字典子类），在 notebook 里逐张显示；每张图建好即从 pyplot 的全局注册表移除，重复调用不会累积。
+18. **`ts_covariance` 的常数窗口**：任一序列在窗口内不动时结果为精确的 0（真值即 0；否则滑动求和会留下符号随机的极小残差）。
+19. **源文件被撤回**：某段源文件被删除且没有替代时，除了把那段数据置空，还会从已存数据重新推导该标的的数据起止时间，那段时间不再算作“已上市”。

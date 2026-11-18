@@ -17,6 +17,7 @@ interrupted build resumes where it stopped.
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -42,10 +43,6 @@ def ms_to_idx(ms: int) -> int:
     return (int(ms) - config.ORIGIN_MS) // MIN
 
 
-def idx_to_ms(idx: int) -> int:
-    return config.ORIGIN_MS + int(idx) * MIN
-
-
 @dataclass
 class Builder:
     key: str
@@ -56,6 +53,8 @@ class Builder:
     fill: dict[str, float] = field(default_factory=dict)
     #: built-ins silently drop rows outside a file's range; user features raise
     strict: bool = False
+    #: threads one ``compute`` call uses itself (DuckDB); bounds the file concurrency
+    threads: int = 1
 
 
 # --------------------------------------------------------------------------- builtins
@@ -198,6 +197,10 @@ def _flush(symbol: str, b: Builder, jobs: list[_Job], man: dict) -> None:
         rng = [t0, t1] if rng is None else [min(rng[0], t0), max(rng[1], t1)]
     for fl in b.fields:
         store.write(m1_path(symbol, fl), lo, span[fl])
+    if any(j.df is None for j in jobs):
+        # Source files were withdrawn: the remembered range may now be too wide, and a
+        # blanked stretch must not keep counting as "listed". Re-derive it from the data.
+        rng = _stored_range(symbol, b)
     files = man.setdefault("files", {})
     for j in jobs:
         if j.name is not None:
@@ -210,19 +213,36 @@ def _flush(symbol: str, b: Builder, jobs: list[_Job], man: dict) -> None:
     store.set_attr(m1_path(symbol), f"build:{b.key}", man)
 
 
+def _stored_range(symbol: str, b: Builder) -> list[int] | None:
+    """[first, last] minute (ms) holding any value of the builder's fields."""
+    first = last = None
+    for fl in b.fields:
+        path = m1_path(symbol, fl)
+        idx = np.flatnonzero(np.isfinite(store.read(path, 0, store.size(path))))
+        if idx.size:
+            first = int(idx[0]) if first is None else min(first, int(idx[0]))
+            last = int(idx[-1]) if last is None else max(last, int(idx[-1]))
+    if first is None:
+        return None
+    return [config.ORIGIN_MS + first * MIN, config.ORIGIN_MS + last * MIN]
+
+
 def sync(
     symbol: str,
     b: Builder,
     workers: int = 8,
     flush_seconds: float | None = None,
     progress: Callable[[str], None] | None = None,
+    files: list[SourceFile] | None = None,
 ) -> bool:
     """Bring the minute arrays of builder ``b`` for ``symbol`` up to date.
 
-    Returns True if anything was (re)computed.
+    Returns True if anything was (re)computed. ``files`` is the current source listing
+    (looked up when omitted).
     """
     flush_seconds = FLUSH_SECONDS if flush_seconds is None else flush_seconds
-    files = sources.list_files(b.dataset, symbol)
+    if files is None:
+        files = sources.list_files(b.dataset, symbol)
     with store.symbol_lock(symbol):
         man = manifest(symbol, b.key)
         if man is None or man.get("def_hash") != b.def_hash or man.get("fields") != b.fields:
@@ -240,16 +260,16 @@ def sync(
 
         blanks: list[_Job] = []
         for name in removed:
-            m = sources._PERIOD_RE.search(name)
-            if m is None:
-                continue
-            d = m.group(3)
-            s, e = sources._period_range(int(m.group(1)), int(m.group(2)), int(d) if d else None)
-            blanks.append(_Job(s, e, None, name=name, stamp=None))
+            parsed = sources.file_period(name)
+            if parsed is not None:
+                blanks.append(_Job(parsed[1], parsed[2], None, name=name, stamp=None))
         if blanks and not pending:
             _flush(symbol, b, blanks, man)
             return True
 
+        # files in parallel x threads per file must not exceed the machine
+        cpus = os.cpu_count() or 1
+        workers = max(1, min(workers, cpus // min(max(1, b.threads), cpus)))
         if progress:
             progress(f"{symbol}/{b.key}: computing {len(pending)} file(s)")
         batch: list[_Job] = list(blanks)
@@ -257,34 +277,25 @@ def sync(
         rows = 0
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
             futs = {pool.submit(b.compute, f, symbol): f for f in pending}
-            for done, fut in enumerate(as_completed(futs), 1):
-                f = futs[fut]
-                df = _validate(fut.result(), b, f)
-                batch.append(_Job(f.start_ms, f.end_ms, df, name=f.name, stamp=f.stamp))
-                rows += (f.end_ms - f.start_ms) // MIN
-                if time.monotonic() - last > flush_seconds or rows > 3_000_000:
+            try:
+                for done, fut in enumerate(as_completed(futs), 1):
+                    f = futs[fut]
+                    df = _validate(fut.result(), b, f)
+                    batch.append(_Job(f.start_ms, f.end_ms, df, name=f.name, stamp=f.stamp))
+                    rows += (f.end_ms - f.start_ms) // MIN
+                    if time.monotonic() - last > flush_seconds or rows > 3_000_000:
+                        _flush(symbol, b, batch, man)
+                        if progress:
+                            progress(f"{symbol}/{b.key}: {done}/{len(pending)} files")
+                        batch, rows, last = [], 0, time.monotonic()
+            finally:
+                # On an error or Ctrl-C: do not start the queued files, and keep every
+                # file that did finish so the next run resumes instead of starting over.
+                for fut in futs:
+                    fut.cancel()
+                if batch:
                     _flush(symbol, b, batch, man)
-                    if progress:
-                        progress(f"{symbol}/{b.key}: {done}/{len(pending)} files")
-                    batch, rows, last = [], 0, time.monotonic()
-        if batch:
-            _flush(symbol, b, batch, man)
         return True
-
-
-def builder_for_field(fld: str) -> Builder:
-    for b in BUILTIN_BUILDERS.values():
-        if fld in b.fields:
-            return b
-    from tsbt.data import features
-
-    fs = features.feature_for_field(fld)
-    if fs is not None:
-        return fs.builder()
-    raise KeyError(
-        f"unknown field {fld!r}; builtin: {sorted(f for b in BUILTIN_BUILDERS.values() for f in b.fields)}"
-        f", derived: ['vwap', 'twap'], features: {sorted(features.feature_fields())}"
-    )
 
 
 def ensure(symbol: str, builders: list[Builder], workers: int = 8, progress=None) -> None:
@@ -294,14 +305,15 @@ def ensure(symbol: str, builders: list[Builder], workers: int = 8, progress=None
         if b.key in seen:
             continue
         seen.add(b.key)
-        if not sources.list_files(b.dataset, symbol):
+        files = sources.list_files(b.dataset, symbol)
+        if not files:
             if b.key == "klines":
                 raise FileNotFoundError(f"no klines files for {symbol} under {config.data_root()}")
             raise FileNotFoundError(
                 f"{symbol} has no {b.dataset!r} data under {config.data_root()} "
                 f"(needed for fields {b.fields})"
             )
-        sync(symbol, b, workers=workers, progress=progress)
+        sync(symbol, b, workers=workers, progress=progress, files=files)
 
 
 def listing_range(symbol: str) -> tuple[int, int]:

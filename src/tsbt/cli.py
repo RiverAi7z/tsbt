@@ -14,16 +14,20 @@ def _build(args) -> int:
     from tsbt.data import api, bars, catalog, m1
 
     fields = args.fields or catalog.KLINE_DEFAULT_FIELDS
-    syms = args.symbols or api.symbols("klines")
+    unknown = [f for f in fields if catalog.spec_for(f) is None]
+    if unknown:
+        print(f"unknown field(s) {unknown}; known: {sorted(api.fields())}", file=sys.stderr)
+        return 2
+    syms = api.symbols("klines") if args.all else args.symbols
     for sym in syms:
         t = time.time()
         try:
             m1.ensure(sym, catalog.builders_for(fields), workers=args.workers, progress=print)
             for fq in args.freq:
                 k = bars.parse_freq(fq)
+                meta: dict = {}
                 for f in fields:
-                    if catalog.spec_for(f) is not None:
-                        bars.ensure_bar_field(sym, f, k, 0)
+                    bars.ensure_bar_field(sym, f, k, 0, meta)
         except FileNotFoundError as e:
             print(f"{sym}: skipped ({e})")
             continue
@@ -34,13 +38,13 @@ def _build(args) -> int:
 def _status(args) -> int:
     from tsbt.data import m1, store
 
-    try:
-        root = store.root()
-        syms = sorted(root["m1"].group_keys()) if "m1" in root else []
-    except Exception:
-        syms = []
     print(f"cache: {config.store_path()}")
     print(f"data : {config.data_root()}")
+    if not config.store_path().exists():  # do not create an empty store just to look
+        print("  (empty)")
+        return 0
+    root = store.root()
+    syms = sorted(root["m1"].group_keys()) if "m1" in root else []
     for sym in syms:
         attrs = dict(store.group(m1.m1_path(sym)).attrs)
         parts = []
@@ -99,7 +103,9 @@ def main(argv=None) -> int:
     cache = sub.add_parser("cache", help="manage the minute/bar cache")
     csub = cache.add_subparsers(dest="action", required=True)
     b = csub.add_parser("build", help="build / update the cache")
-    b.add_argument("--symbols", nargs="*", help="default: every klines symbol")
+    which = b.add_mutually_exclusive_group(required=True)
+    which.add_argument("--symbols", nargs="+", help="symbols to build")
+    which.add_argument("--all", action="store_true", help="every klines symbol (hundreds)")
     b.add_argument("--freq", nargs="*", default=[], help="also pre-build bars, e.g. 1h 4h 1D")
     b.add_argument("--fields", nargs="*", help="default: all klines fields")
     b.add_argument("--workers", type=int, default=8)
