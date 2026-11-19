@@ -17,7 +17,15 @@ DAY_MS = 86_400_000
 CHUNK = 524_288
 
 DEFAULT_DATA_ROOT = "/share/binance_data/futures/um"
-DEFAULT_CACHE_DIR = "~/.cache/tsbt"
+#: Project root when running from a source checkout (src/tsbt/config.py -> repo root).
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+#: Cache lives in the project (``<repo>/.cache``, gitignored); falls back to the user
+#: cache dir when tsbt is installed outside a checkout.
+DEFAULT_CACHE_DIR = str(
+    _PROJECT_ROOT / ".cache"
+    if (_PROJECT_ROOT / "pyproject.toml").is_file()
+    else Path("~/.cache/tsbt")
+)
 
 _overrides: dict[str, str] = {}
 

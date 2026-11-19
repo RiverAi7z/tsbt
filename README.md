@@ -93,7 +93,7 @@ bt.run(np.column_stack([s1, s2, s3]), bt.load("BTCUSDT", "4h"),
 
 ## 数据与缓存
 
-- 数据根默认 `/share/binance_data/futures/um`（`TSBT_DATA_ROOT`），缓存默认 `~/.cache/tsbt`（`TSBT_CACHE_DIR`），也可用 `bt.set_paths(...)`。
+- 数据根默认 `/share/binance_data/futures/um`（`TSBT_DATA_ROOT`），缓存默认在项目根目录的 `.cache/`（已 gitignore；`TSBT_CACHE_DIR` 可覆盖，非源码安装时退回 `~/.cache/tsbt`），也可用 `bt.set_paths(...)`。
 - 某个月有 monthly 文件时，该月的 daily 文件忽略。
 - 第一次使用某个（标的 × 数据集）时，把源文件合成为 1 分钟数组存入 zarr；之后每次加载只比对源文件清单（文件名 / 大小 / mtime），新文件只增量处理。bar 由分钟数据 reshape 归约而来，同样缓存。
 - 内置字段：`open high low close volume quote_volume count taker_buy_volume taker_buy_quote_volume vwap twap`（klines）；`oi oi_value top_ls_acct top_ls_pos ls_acct taker_ls_vol`（metrics，5 分钟一条，bar 取最后一条；记录时间恰在 bar 边界时归入下一根 bar）。

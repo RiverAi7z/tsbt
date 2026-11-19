@@ -251,7 +251,7 @@ def custom(chunk: bt.SourceChunk) -> pl.DataFrame:
 - **首次**：构建并落盘。**之后**：只比对源文件清单（文件名 / 大小 / mtime），不读源数据。
 - 尾部新增文件 → 增量追加；已有文件发生变化 → 该（标的 × 数据集）重建。
 - 构建期间按标的加文件锁，避免并发写。
-- 缓存位置 `TSBT_CACHE_DIR`（默认 `~/.cache/tsbt`），数据根 `TSBT_DATA_ROOT`（默认 `/share/binance_data/futures/um`）。
+- 缓存位置 `TSBT_CACHE_DIR`（默认项目根目录的 `.cache/`，非源码安装时为 `~/.cache/tsbt`），数据根 `TSBT_DATA_ROOT`（默认 `/share/binance_data/futures/um`）。
 - CLI：`tsbt cache build (--symbols ... | --all) --freq ... [--workers N]`（必须指明标的，全量构建要显式写 `--all`）、`tsbt cache status`、`tsbt cache clear [--symbol ...] [--field ...]`。
 
 ### 6.9 加载 API
@@ -584,7 +584,7 @@ tsbt/
 6. **信号 NaN 默认平仓**（`nan_policy="flat"`），预热期不持仓。
 7. **默认资金分配是静态 `1/N`**；标的上市时间不一时，早期会有闲置资金。想避免可用 `equal_active()`。
 8. **基准用同口径的“信号恒为 1”**：复利下即买入持有，单利下为标的简单收益累加。
-9. **缓存用 zarr v3，位置默认 `~/.cache/tsbt`**（`/home` 剩余 1.5 TB）。
+9. **缓存用 zarr v3，位置默认项目根目录的 `.cache/`**（`/home` 剩余 1.5 TB）。
 10. **算子依赖 bottleneck + numba**（递推算子无法纯 numpy 向量化）；回测引擎本身只用 numpy。
 11. **`hump` 改为绝对阈值**，与 AlphaForge 的截面缩放语义不同。
 12. **metrics 时间戳按“该时刻之后才可知”处理**，bar 边界上的记录归下一根 bar（偏保守 1 分钟）。
