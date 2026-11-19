@@ -42,7 +42,7 @@
 | `premiumIndexKlines` | 1m | monthly 2023-01 ~ 2026-10 + daily 2026-11-01 ~ 11-17 | 1.0 GB | 否（加一条注册即可） |
 | `aggTrades` | 逐笔（归集） | monthly 2023-01 ~ 2026-10 + daily 2026-11-01 ~ 11-17 | 141 GB | 是 |
 
-1m 数据集都多一层 `1m/` 目录。当前读取规则是：某个月有 monthly 文件时，忽略该月所有 daily 文件。对 index / premium 来说，这条规则会丢掉月度文件里缺的那几天，见下文。
+1m 数据集都多一层 `1m/` 目录。某个月有 monthly 文件时，该月的 daily 文件会被忽略，所以 monthly 文件必须完整。index / premium 的月度文件原本缺几个整天，已经补齐，见下文。
 
 ## 字段
 
@@ -88,29 +88,35 @@
 
 反算与实际值仍有差异，主要有两个原因：一是用的是 1m 溢价指数，Binance 实际按每 5 秒采样计算；二是极端行情（如 2025-10-11 00:00）。另外 2023-08-29 16:00 这一期在多个标的上偏差都很大，原因未查。
 
-### indexPriceKlines / premiumIndexKlines：月度文件缺天，daily 文件可补齐
+### indexPriceKlines / premiumIndexKlines：缺整天的月度文件已补齐
 
-Binance 官方的**月度 zip 本身就缺下面这几天**（已从 data.binance.vision 下载原始 zip 核对行数），本地 monthly parquet 与原始 zip 一致。但这几天的 **daily 文件在官方和本地都有，且完整**（每个 1,440 行）。
+Binance 官方的月度 zip 缺下面这几天，而同一天的 daily 文件是完整的（每个 1,440 行）。官方月度 zip 只下载核对了 BTCUSDT 的 4 个文件，其他标的根据本地文件判断。
 
-问题出在读取规则：当前规则是某个月有 monthly 文件时，忽略该月所有 daily 文件，这几天因此被丢掉。改成“monthly 缺的日期用 daily 补”之后，这些整天缺口全部消失。
+2026-11-19 用一次性脚本把这些天从本地 daily 文件补进了本地 monthly parquet，共 43 个文件、70,560 行。
 
-| 数据集 | 日期 | 标的 | monthly | daily |
-|---|---|---|---|---|
-| index | 2023-02-13 | BTC BNB AVAX | 缺整天 | 完整 |
-| index | 2023-02-24 | 全部 10 个 | 缺整天 | 完整 |
-| index | 2023-04-07、04-08 | BTC BNB AVAX | 缺整天 | 完整 |
-| index | 2026-06-29 | 全部 10 个 | 缺整天 | 完整 |
-| premium | 2023-02-24 | BTC BNB AVAX LINK | 缺整天 | 完整 |
-| premium | 2023-04-09 | ETH SOL XRP DOGE ADA LTC | 缺整天 | 完整 |
-| premium | 2026-06-29 | 全部 10 个 | 缺整天 | 完整 |
+| 数据集 | 日期 | 标的 |
+|---|---|---|
+| index | 2023-02-13 | BTC BNB AVAX |
+| index | 2023-02-24 | 全部 10 个 |
+| index | 2023-04-07、04-08 | BTC BNB AVAX |
+| index | 2026-06-29 | 全部 10 个 |
+| premium | 2023-02-24 | BTC BNB AVAX LINK |
+| premium | 2023-04-09 | ETH SOL XRP DOGE ADA LTC |
+| premium | 2026-06-29 | 全部 10 个 |
 
-补齐之后，剩下的是**源数据本身的缺失**（官方 daily zip 也是这个行数）：
+- 原文件备份在 `/share/binance_data/futures/um_monthly_gapfill_backup/`，目录结构与数据根相同，脚本 `fill_monthly_gaps.py` 也在里面。
+- 补齐后的文件与原文件相比，原有的行一行不少、内容不变，新增的行与 daily 文件完全一致。
+- **如果重新下载这些月度文件，缺口会回来**，需要重跑脚本。脚本不带参数时只列出缺口，加 `--apply` 才写文件。
+
+补齐之后，剩下的是**源数据本身的缺失**（官方 daily zip 也是这个行数），无法补：
 
 | 数据集 | 日期 | 缺失 | 标的 |
 |---|---|---|---|
 | index | 2024-08-12 | 2 分钟（1,438 / 1,440） | 全部 10 个 |
 | premium | 2023-11-10 | 14 分钟（1,426 / 1,440） | 全部 10 个 |
 | premium | 2024-08-12 | 2 分钟（1,438 / 1,440） | 全部 10 个 |
+
+现在每个标的 index 有 2,040,478 行、premium 有 2,040,464 行，完整应为 2,040,480 行。
 
 ### metrics：基本完整，时间戳需要对齐
 
