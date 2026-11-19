@@ -135,8 +135,29 @@ BUILTIN_BUILDERS: dict[str, Builder] = {
 # --------------------------------------------------------------------------- sync
 
 
+#: builder manifests are stored as attributes ``build:<builder key>`` of ``m1/<SYMBOL>``
+_MANIFEST = "build:"
+
+
+def _manifest_key(key: str) -> str:
+    return _MANIFEST + key
+
+
 def manifest(symbol: str, key: str) -> dict | None:
-    return store.get_attr(m1_path(symbol), f"build:{key}")
+    return store.get_attr(m1_path(symbol), _manifest_key(key))
+
+
+def manifests(symbol: str) -> dict[str, dict]:
+    """Every builder manifest of a symbol, keyed by builder key."""
+    g = store.group(m1_path(symbol), create=False)
+    attrs = g.attrs.asdict() if g is not None else {}
+    return {k[len(_MANIFEST) :]: v for k, v in attrs.items() if k.startswith(_MANIFEST)}
+
+
+def drop_manifest(symbol: str, key: str) -> None:
+    g = store.group(m1_path(symbol), create=False)
+    if g is not None:
+        g.attrs.pop(_manifest_key(key), None)
 
 
 def _validate(df: pl.DataFrame, b: Builder, f: SourceFile) -> pl.DataFrame:
@@ -210,7 +231,7 @@ def _flush(symbol: str, b: Builder, jobs: list[_Job], man: dict) -> None:
                 files[j.name] = j.stamp
     man["range"] = rng
     man["version"] = time.time_ns()
-    store.set_attr(m1_path(symbol), f"build:{b.key}", man)
+    store.set_attr(m1_path(symbol), _manifest_key(b.key), man)
 
 
 def _stored_range(symbol: str, b: Builder) -> list[int] | None:
@@ -231,7 +252,6 @@ def sync(
     symbol: str,
     b: Builder,
     workers: int = 8,
-    flush_seconds: float | None = None,
     progress: Callable[[str], None] | None = None,
     files: list[SourceFile] | None = None,
 ) -> bool:
@@ -240,7 +260,6 @@ def sync(
     Returns True if anything was (re)computed. ``files`` is the current source listing
     (looked up when omitted).
     """
-    flush_seconds = FLUSH_SECONDS if flush_seconds is None else flush_seconds
     if files is None:
         files = sources.list_files(b.dataset, symbol)
     with store.symbol_lock(symbol):
@@ -250,7 +269,7 @@ def sync(
                 for fl in set(man.get("fields", [])) | set(b.fields):
                     store.delete(m1_path(symbol, fl))
             man = {"def_hash": b.def_hash, "fields": list(b.fields), "files": {}, "range": None}
-            store.set_attr(m1_path(symbol), f"build:{b.key}", man)
+            store.set_attr(m1_path(symbol), _manifest_key(b.key), man)
         built = man.get("files", {})
         current = {f.name: f for f in files}
         pending = [f for f in files if built.get(f.name) != f.stamp]
@@ -275,7 +294,7 @@ def sync(
         batch: list[_Job] = list(blanks)
         last = time.monotonic()
         rows = 0
-        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
             futs = {pool.submit(b.compute, f, symbol): f for f in pending}
             try:
                 for done, fut in enumerate(as_completed(futs), 1):
@@ -283,7 +302,7 @@ def sync(
                     df = _validate(fut.result(), b, f)
                     batch.append(_Job(f.start_ms, f.end_ms, df, name=f.name, stamp=f.stamp))
                     rows += (f.end_ms - f.start_ms) // MIN
-                    if time.monotonic() - last > flush_seconds or rows > 3_000_000:
+                    if time.monotonic() - last > FLUSH_SECONDS or rows > 3_000_000:
                         _flush(symbol, b, batch, man)
                         if progress:
                             progress(f"{symbol}/{b.key}: {done}/{len(pending)} files")

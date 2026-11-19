@@ -10,6 +10,7 @@ import numpy as np
 from tsbt import config
 from tsbt.data import bars, catalog, m1, sources, store
 from tsbt.data import features as feats
+from tsbt.ops._util import ffill as _ffill
 
 MIN = config.MINUTE_MS
 
@@ -34,17 +35,6 @@ def to_ms(t) -> int | None:
 
 def _ms_to_dt64(ms) -> np.ndarray:
     return np.asarray(ms, dtype=np.int64).astype("datetime64[ms]")
-
-
-def _ffill_limit(x: np.ndarray, limit: int) -> np.ndarray:
-    if limit <= 0:
-        return x
-    valid = np.isfinite(x)
-    rows = np.arange(x.shape[0])[:, None]
-    idx = np.maximum.accumulate(np.where(valid, rows, -1), axis=0)
-    got = np.take_along_axis(x, np.maximum(idx, 0), axis=0)
-    ok = (idx >= 0) & (rows - idx <= limit)
-    return np.where(valid, x, np.where(ok, got, np.nan))
 
 
 class _Fields:
@@ -80,10 +70,10 @@ class _Fields:
 
 
 def _ensure(sym: str, names, workers: int, done: set, meta: dict | None = None) -> None:
-    todo = [b for b in catalog.builders_for(names) if (sym, b.key) not in done]
+    todo = [k for k in catalog.builder_keys(names) if (sym, k) not in done]
     if todo:
-        m1.ensure(sym, todo, workers=workers)
-        done.update((sym, b.key) for b in todo)
+        m1.ensure(sym, [catalog.builder(k) for k in todo], workers=workers)
+        done.update((sym, k) for k in todo)
         if meta is not None:
             meta.pop(("m1", sym), None)  # versions may have changed
 
@@ -108,7 +98,7 @@ class M1View(_Fields):
         for i, sym in enumerate(self.symbols):
             _ensure(sym, [name], self._workers, self._done)
             out[:, i] = catalog.minute_values(sym, name, self.start_ms, end)
-        return _ffill_limit(out, spec.m1_ffill)
+        return _ffill(out, spec.m1_ffill) if spec.m1_ffill > 0 else out
 
 
 class BarData(_Fields):
@@ -276,7 +266,7 @@ class BarData(_Fields):
             uj, first = np.unique(jj, return_index=True)  # first in reversed = last in time
             out[uj, c] = vv[first]
         if ffill:
-            out = _ffill_limit(out, self.T)
+            out = _ffill(out)
         if v.shape[1] == 1 and self.N > 1:
             out = np.repeat(out, self.N, axis=1)
         return out[:, 0] if self._scalar else out

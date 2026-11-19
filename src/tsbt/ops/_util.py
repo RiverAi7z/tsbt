@@ -30,6 +30,19 @@ def purify(x):
     return out
 
 
+def ffill(x: np.ndarray, limit: int | None = None) -> np.ndarray:
+    """Forward-fill non-finite entries along axis 0 with the latest finite value, at most
+    ``limit`` rows old (``None`` = no limit). Leading gaps stay NaN."""
+    valid = np.isfinite(x)
+    rows = np.arange(x.shape[0]).reshape(-1, *([1] * (x.ndim - 1)))
+    idx = np.maximum.accumulate(np.where(valid, rows, -1), axis=0)
+    got = np.take_along_axis(x, np.maximum(idx, 0), axis=0)
+    keep = idx >= 0
+    if limit is not None:
+        keep &= rows - idx <= limit
+    return np.where(keep, got, np.nan)
+
+
 def as2d(x) -> tuple[np.ndarray, bool]:
     a = np.asarray(x, dtype=np.float64)
     if a.ndim == 1:

@@ -60,6 +60,12 @@ def group(path: str, create: bool = True) -> zarr.Group | None:
     return node if isinstance(node, zarr.Group) else None
 
 
+def children(path: str) -> list[str]:
+    """Sorted names of the sub-groups of ``path`` (empty when it does not exist)."""
+    g = group(path, create=False)
+    return sorted(g.group_keys()) if g is not None else []
+
+
 def has_array(path: str) -> bool:
     try:
         node = root()[path]

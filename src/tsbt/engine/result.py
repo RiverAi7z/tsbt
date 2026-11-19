@@ -13,7 +13,6 @@ import numpy as np
 import polars as pl
 
 from tsbt import metrics as M
-from tsbt.config import DAY_MS
 
 
 def _iso(ms: int) -> str:
@@ -22,7 +21,7 @@ def _iso(ms: int) -> str:
 
 def _year_month(ms: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """UTC (year, month) of the day a time stamp *ends* (00:00 belongs to the day before)."""
-    d = ((np.asarray(ms, dtype=np.int64) - 1) // DAY_MS).astype("datetime64[D]")
+    d = M.day_key(ms).astype("datetime64[D]")
     y = d.astype("datetime64[Y]").astype(int) + 1970
     m = d.astype("datetime64[M]").astype(int) % 12 + 1
     return y, m
@@ -148,11 +147,11 @@ class Result:
         _, g = M.daily_values(t, self._path(self.nav_gross)[1])
         _, bm = M.daily_values(t, self._path(self.bench)[1])
         dt_, dv = M.daily_values(t, nav)
-        key = (t[1:] - 1) // DAY_MS
+        key = M.day_key(t[1:])
         day_turn = np.bincount(np.unique(key, return_inverse=True)[1], weights=self.turnover)
         return pl.DataFrame(
             {
-                "date": ((dt_[1:] - 1) // DAY_MS).astype("datetime64[D]"),
+                "date": M.day_key(dt_[1:]).astype("datetime64[D]"),
                 "nav": dv[1:],
                 "nav_gross": g[1:],
                 "benchmark": bm[1:],
@@ -164,18 +163,17 @@ class Result:
     def _segments(self, labels: np.ndarray):
         """Yield (label, times, nav, turnover) for consecutive groups of NAV points."""
         t, nav = self._path(self.nav)
-        lab = labels
-        bounds = np.r_[0, np.nonzero(lab[1:] != lab[:-1])[0] + 1, len(lab)]
+        bounds = np.r_[0, np.nonzero(labels[1:] != labels[:-1])[0] + 1, len(labels)]
         for a, z in zip(bounds[:-1], bounds[1:], strict=True):
-            base = a  # point index a in `lab` is point a+1 in the path
-            seg_t = t[base : z + 1]
-            seg_v = nav[base : z + 1]
+            # label a belongs to path point a + 1; the segment starts from point a
+            seg_t = t[a : z + 1]
+            seg_v = nav[a : z + 1]
             if self.compound:
                 with np.errstate(divide="ignore", invalid="ignore"):
                     seg_v = seg_v / seg_v[0] if seg_v[0] > 0 else np.full_like(seg_v, np.nan)
             else:
                 seg_v = seg_v - seg_v[0] + 1.0
-            yield lab[a], seg_t, seg_v, self.turnover[a:z]
+            yield labels[a], seg_t, seg_v, self.turnover[a:z]
 
     def yearly(self) -> pl.DataFrame:
         y, _ = _year_month(self.close_ms)

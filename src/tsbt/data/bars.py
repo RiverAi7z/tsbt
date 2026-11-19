@@ -81,22 +81,14 @@ def _red_var(b, ddof=1):
     return np.where(n > ddof, out, np.nan)
 
 
-def _red_skew(b):
+def _red_std_moment(b, k: int, excess: float):
+    """Standardised population moment m_k / m2^(k/2) - excess; needs >= k samples."""
     n, _, dev = _moments(b)
     m2 = (dev**2).sum(axis=1) / np.maximum(n, 1)
-    m3 = (dev**3).sum(axis=1) / np.maximum(n, 1)
+    mk = (dev**k).sum(axis=1) / np.maximum(n, 1)
     with np.errstate(invalid="ignore", divide="ignore"):
-        out = m3 / m2**1.5
-    return np.where((n >= 3) & np.isfinite(out), out, np.nan)
-
-
-def _red_kurt(b):
-    n, _, dev = _moments(b)
-    m2 = (dev**2).sum(axis=1) / np.maximum(n, 1)
-    m4 = (dev**4).sum(axis=1) / np.maximum(n, 1)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        out = m4 / m2**2 - 3.0
-    return np.where((n >= 4) & np.isfinite(out), out, np.nan)
+        out = mk / m2 ** (k / 2) - excess
+    return np.where((n >= k) & np.isfinite(out), out, np.nan)
 
 
 def _quiet(fn):
@@ -119,8 +111,8 @@ REDUCERS: dict[str, Callable] = {
     "min": _quiet(lambda b: np.nanmin(b, axis=1)),
     "median": _quiet(lambda b: np.nanmedian(b, axis=1)),
     "count": lambda b: np.isfinite(b).sum(axis=1).astype(np.float64),
-    "skew": _quiet(_red_skew),
-    "kurt": _quiet(_red_kurt),
+    "skew": _quiet(lambda b: _red_std_moment(b, 3, 0.0)),
+    "kurt": _quiet(lambda b: _red_std_moment(b, 4, 3.0)),
 }
 
 
@@ -184,24 +176,29 @@ def bar_open_ms(j, k: int, offset: int):
     return config.ORIGIN_MS + (offset + np.asarray(j, dtype=np.int64) * k) * MIN
 
 
-def _m1_meta(symbol: str, meta: dict | None) -> dict:
-    """Build versions + klines listing range of a symbol (memoised in ``meta``)."""
-    key = ("m1", symbol)
-    if meta is not None and key in meta:
-        return meta[key]
-    g = store.group(m1.m1_path(symbol), create=False)
-    attrs = g.attrs.asdict() if g is not None else {}
+def _memo(meta: dict | None, key, fn):
+    """``fn()`` memoised in ``meta`` (store metadata shared within one load)."""
+    if meta is None:
+        return fn()
+    if key not in meta:
+        meta[key] = fn()
+    return meta[key]
+
+
+def _read_m1_meta(symbol: str) -> dict:
+    mans = m1.manifests(symbol)
     info = {
-        "versions": {
-            k[6:]: int(v.get("version", 0)) for k, v in attrs.items() if k.startswith("build:")
-        },
-        "range": (attrs.get("build:klines") or {}).get("range"),
+        "versions": {k: int(v.get("version", 0)) for k, v in mans.items()},
+        "range": (mans.get("klines") or {}).get("range"),
     }
     if not info["range"]:
         raise RuntimeError(f"klines for {symbol} not built")
-    if meta is not None:
-        meta[key] = info
     return info
+
+
+def _m1_meta(symbol: str, meta: dict | None) -> dict:
+    """Build versions + klines listing range of a symbol (memoised in ``meta``)."""
+    return _memo(meta, ("m1", symbol), lambda: _read_m1_meta(symbol))
 
 
 def symbol_bar_range(symbol: str, k: int, offset: int, meta: dict | None = None) -> tuple[int, int]:
@@ -238,9 +235,19 @@ def compute_bar_field(symbol: str, name: str, j0: int, j1: int, k: int, offset: 
     return reduce(x, spec.rule)
 
 
-def _bar_path(k, offset, symbol, name=None) -> str:
-    base = f"bar/{tag(k, offset)}/{symbol}"
+def tag_path(bar_tag: str, symbol: str, name: str | None = None) -> str:
+    """Store path of a symbol's bar group (or one field) for a bar grid tag."""
+    base = f"bar/{bar_tag}/{symbol}"
     return base if name is None else f"{base}/{name}"
+
+
+def _bar_path(k, offset, symbol, name=None) -> str:
+    return tag_path(tag(k, offset), symbol, name)
+
+
+def field_attr(name: str) -> str:
+    """Attribute of a bar group recording how its field ``name`` was built."""
+    return f"v:{name}"
 
 
 def _src_version(symbol: str, name: str, meta: dict | None = None) -> str:
@@ -262,23 +269,22 @@ def ensure_bar_field(
     j0, j1 = symbol_bar_range(symbol, k, offset, meta)
     gpath = _bar_path(k, offset, symbol)
     want = {"src": _src_version(symbol, name, meta), "j0": j0, "j1": j1}
-    akey = ("l2", gpath)
-    if meta is not None and akey in meta:
-        attrs = meta[akey]
-    else:
-        g = store.group(gpath, create=False)
-        attrs = g.attrs.asdict() if g is not None else {}
-        if meta is not None:
-            meta[akey] = attrs
-    if attrs.get(f"v:{name}") == want:
+    attrs = _memo(meta, ("l2", gpath), lambda: _group_attrs(gpath))
+    if attrs.get(field_attr(name)) == want:
         return j0, j1
+    path = _bar_path(k, offset, symbol, name)
     with store.symbol_lock(symbol):
         vals = compute_bar_field(symbol, name, j0, j1, k, offset)
-        store.delete(_bar_path(k, offset, symbol, name))
-        store.write(_bar_path(k, offset, symbol, name), j0, vals)
-        store.set_attr(gpath, f"v:{name}", want)
-    attrs[f"v:{name}"] = want
+        store.delete(path)
+        store.write(path, j0, vals)
+        store.set_attr(gpath, field_attr(name), want)
+    attrs[field_attr(name)] = want
     return j0, j1
+
+
+def _group_attrs(path: str) -> dict:
+    g = store.group(path, create=False)
+    return g.attrs.asdict() if g is not None else {}
 
 
 def read_bar_field(symbol: str, name: str, k: int, offset: int, jlo: int, jhi: int) -> np.ndarray:

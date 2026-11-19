@@ -43,26 +43,21 @@ def _status(args) -> int:
     if not config.store_path().exists():  # do not create an empty store just to look
         print("  (empty)")
         return 0
-    root = store.root()
-    syms = sorted(root["m1"].group_keys()) if "m1" in root else []
-    for sym in syms:
-        attrs = dict(store.group(m1.m1_path(sym)).attrs)
+    for sym in store.children("m1"):
         parts = []
-        for key, man in sorted(attrs.items()):
-            if not key.startswith("build:"):
-                continue
+        for key, man in sorted(m1.manifests(sym).items()):
             rng = man.get("range")
             span = ""
             if rng:
                 a, b = (time.strftime("%Y-%m-%d", time.gmtime(x / 1000)) for x in rng)
                 span = f" {a}..{b}"
-            parts.append(f"{key[6:]}[{len(man.get('files', {}))} files{span}]")
+            parts.append(f"{key}[{len(man.get('files', {}))} files{span}]")
         print(f"  {sym}: " + ", ".join(parts))
     return 0
 
 
 def _clear(args) -> int:
-    from tsbt.data import store
+    from tsbt.data import bars, m1, store
 
     if not args.symbol and not args.field:
         path = config.store_path()
@@ -71,28 +66,26 @@ def _clear(args) -> int:
         store.forget()
         print(f"removed {path}")
         return 0
-    root = store.root()
-    for sym in args.symbol or (sorted(root["m1"].group_keys()) if "m1" in root else []):
+    tags = store.children("bar")
+    for sym in args.symbol or store.children("m1"):
         if args.field:
             for f in args.field:
-                store.delete(f"m1/{sym}/{f}")
-            g = store.group(f"m1/{sym}", create=False)
-            if g is not None:
-                for key, man in dict(g.attrs).items():
-                    if key.startswith("build:") and set(args.field) & set(man.get("fields", [])):
-                        del g.attrs[key]
+                store.delete(m1.m1_path(sym, f))
+            for key, man in m1.manifests(sym).items():
+                if set(args.field) & set(man.get("fields", [])):
+                    m1.drop_manifest(sym, key)
         else:
-            store.delete(f"m1/{sym}")
-        for tag in sorted(root["bar"].group_keys()) if "bar" in root else []:
+            store.delete(m1.m1_path(sym))
+        for tag in tags:
             if args.field:
                 for f in args.field:
-                    store.delete(f"bar/{tag}/{sym}/{f}")
-                g = store.group(f"bar/{tag}/{sym}", create=False)
+                    store.delete(bars.tag_path(tag, sym, f))
+                g = store.group(bars.tag_path(tag, sym), create=False)
                 if g is not None:
                     for f in args.field:
-                        g.attrs.pop(f"v:{f}", None)
+                        g.attrs.pop(bars.field_attr(f), None)
             else:
-                store.delete(f"bar/{tag}/{sym}")
+                store.delete(bars.tag_path(tag, sym))
         print(f"cleared {sym} {args.field or ''}")
     return 0
 

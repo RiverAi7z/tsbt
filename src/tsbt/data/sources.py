@@ -157,7 +157,8 @@ def file_period(name: str) -> tuple[str, int, int] | None:
     return m.group(0)[: -len(".parquet")], start, end
 
 
-def _scan(kind: str, ds: Dataset, symbol: str) -> list[SourceFile]:
+def _scan(kind: str, ds: Dataset, symbol: str, skip_months=frozenset()) -> list[SourceFile]:
+    """Source files of one kind; daily files of a month in ``skip_months`` are not stat'ed."""
     base = config.data_root() / kind / ds.subdir.format(sym=symbol)
     if not base.is_dir():
         return []
@@ -171,6 +172,8 @@ def _scan(kind: str, ds: Dataset, symbol: str) -> list[SourceFile]:
                 continue
             period, start, end = parsed
             if (kind == "monthly") != (len(period) == 7):  # YYYY-MM vs YYYY-MM-DD
+                continue
+            if period[:7] in skip_months:
                 continue
             st = entry.stat()
             out.append(
@@ -192,8 +195,7 @@ def list_files(dataset: str, symbol: str) -> list[SourceFile]:
     """Selected source files (monthly preferred over daily), sorted by time."""
     ds = get_dataset(dataset)
     monthly = _scan("monthly", ds, symbol)
-    months = {f.period for f in monthly}
-    daily = [f for f in _scan("daily", ds, symbol) if f.period[:7] not in months]
+    daily = _scan("daily", ds, symbol, skip_months={f.period for f in monthly})
     return sorted(monthly + daily, key=lambda f: f.start_ms)
 
 

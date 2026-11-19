@@ -59,19 +59,26 @@ def spec_for(name: str) -> FieldSpec | None:
     return None
 
 
-def builders_for(names) -> list:
-    out = [m1.BUILTIN_BUILDERS["klines"]]
+def builder_keys(names) -> list[str]:
+    """Keys of the minute builders the fields need (klines first, each once)."""
+    keys = {"klines": None}
     for name in names:
         spec = spec_for(name)
-        if spec is None:
-            continue  # user bar field; resolved at load time
-        if spec.builder in m1.BUILTIN_BUILDERS:
-            out.append(m1.BUILTIN_BUILDERS[spec.builder])
-        else:
-            from tsbt.data import features
+        if spec is not None:  # None: user bar field, resolved at load time
+            keys[spec.builder] = None
+    return list(keys)
 
-            out.append(features.FEATURES[spec.builder.split(":", 1)[1]].builder())
-    return out
+
+def builder(key: str):
+    if key in m1.BUILTIN_BUILDERS:
+        return m1.BUILTIN_BUILDERS[key]
+    from tsbt.data import features
+
+    return features.FEATURES[key.split(":", 1)[1]].builder()
+
+
+def builders_for(names) -> list:
+    return [builder(k) for k in builder_keys(names)]
 
 
 def minute_price(qv: np.ndarray, v: np.ndarray, close: np.ndarray) -> np.ndarray:

@@ -13,7 +13,7 @@ import bottleneck as bn
 import numba as nb
 import numpy as np
 
-from tsbt.ops._util import check_d, min_valid, purify, ts_op, ts_op2
+from tsbt.ops._util import check_d, ffill, min_valid, purify, ts_op, ts_op2
 
 # --------------------------------------------------------------------------- shift / fill
 
@@ -52,12 +52,7 @@ def log_diff(x):
 @ts_op
 def ts_backfill(x, d: int):
     """Forward-fill NaN with the latest valid value at most ``d`` bars old."""
-    d = check_d(d)
-    valid = np.isfinite(x)
-    rows = np.arange(x.shape[0])[:, None]
-    idx = np.maximum.accumulate(np.where(valid, rows, -1), axis=0)
-    got = np.take_along_axis(x, np.maximum(idx, 0), axis=0)
-    return np.where((idx >= 0) & (rows - idx <= d), got, np.nan)
+    return ffill(x, check_d(d))
 
 
 # --------------------------------------------------------------------------- bottleneck
@@ -273,28 +268,37 @@ def _gate(out, cnt, mc):
     return out
 
 
+def _gated(x, kernel, mc: int):
+    """Run a window ``kernel(a) -> (count, value)`` and gate it with :func:`_gate`."""
+
+    def k(a):
+        with np.errstate(all="ignore"):
+            cnt, out = kernel(a)
+        return _gate(out, cnt, mc)
+
+    return ts_op(k)(x)
+
+
 def ts_skewness(x, d: int):
     """Population skewness m3 / m2^1.5; needs >= max(min_valid, 3) samples."""
     d = check_d(d)
 
-    def k(a):
+    def kern(a):
         cnt, m2, m3 = _moments_nb(a, d, 3)
-        with np.errstate(all="ignore"):
-            return _gate(m3 / m2**1.5, cnt, max(min_valid(d), 3))
+        return cnt, m3 / m2**1.5
 
-    return ts_op(k)(x)
+    return _gated(x, kern, max(min_valid(d), 3))
 
 
 def ts_kurtosis(x, d: int):
     """Excess kurtosis m4 / m2^2 - 3; needs >= max(min_valid, 4) samples."""
     d = check_d(d)
 
-    def k(a):
+    def kern(a):
         cnt, m2, m4 = _moments_nb(a, d, 4)
-        with np.errstate(all="ignore"):
-            return _gate(m4 / m2**2 - 3.0, cnt, max(min_valid(d), 4))
+        return cnt, m4 / m2**2 - 3.0
 
-    return ts_op(k)(x)
+    return _gated(x, kern, max(min_valid(d), 4))
 
 
 def ts_moment(x, d: int, k: int):
@@ -306,9 +310,9 @@ def ts_moment(x, d: int, k: int):
 
     def kern(a):
         cnt, _, mk = _moments_nb(a, d, k)
-        return _gate(mk, cnt, min_valid(d))
+        return cnt, mk
 
-    return ts_op(kern)(x)
+    return _gated(x, kern, min_valid(d))
 
 
 @nb.njit(cache=True)
@@ -332,12 +336,7 @@ def _product_nb(x, d):
 
 def ts_product(x, d: int):
     d = check_d(d)
-
-    def k(a):
-        cnt, p = _product_nb(a, d)
-        return _gate(p, cnt, min_valid(d))
-
-    return ts_op(k)(x)
+    return _gated(x, lambda a: _product_nb(a, d), min_valid(d))
 
 
 @nb.njit(cache=True)
@@ -368,22 +367,12 @@ def _arg_extreme_nb(x, d, want_max):
 def ts_arg_max(x, d: int):
     """Bars since the window maximum (0 = today; ties -> most recent)."""
     d = check_d(d)
-
-    def k(a):
-        cnt, out = _arg_extreme_nb(a, d, True)
-        return _gate(out, cnt, min_valid(d))
-
-    return ts_op(k)(x)
+    return _gated(x, lambda a: _arg_extreme_nb(a, d, True), min_valid(d))
 
 
 def ts_arg_min(x, d: int):
     d = check_d(d)
-
-    def k(a):
-        cnt, out = _arg_extreme_nb(a, d, False)
-        return _gate(out, cnt, min_valid(d))
-
-    return ts_op(k)(x)
+    return _gated(x, lambda a: _arg_extreme_nb(a, d, False), min_valid(d))
 
 
 @nb.njit(cache=True)
@@ -479,12 +468,7 @@ def ts_quantile(x, d: int, driver: str = "gaussian"):
     if driver not in codes:
         raise ValueError(f"driver must be one of {sorted(codes)}, got {driver!r}")
     code = codes[driver]
-
-    def k(a):
-        cnt, out = _quantile_nb(a, d, code)
-        return _gate(out, cnt, min_valid(d))
-
-    return ts_op(k)(x)
+    return _gated(x, lambda a: _quantile_nb(a, d, code), min_valid(d))
 
 
 @nb.njit(cache=True)
@@ -562,6 +546,9 @@ def _decay_exp_nb(x, d, f):
     t_len, n = x.shape
     cnt = np.zeros((t_len, n))
     out = np.full((t_len, n), np.nan)
+    ws = np.empty(min(d, t_len))
+    for i in range(ws.shape[0]):
+        ws[i] = (1.0 - f) * f**i
     for j in range(n):
         for t in range(t_len):
             num = 0.0
@@ -570,7 +557,7 @@ def _decay_exp_nb(x, d, f):
             for i in range(min(d, t + 1)):
                 v = x[t - i, j]
                 if np.isfinite(v):
-                    w = (1.0 - f) * f**i
+                    w = ws[i]
                     num += w * v
                     den += w
                     c += 1
@@ -585,12 +572,7 @@ def ts_decay_exp_window(x, d: int, factor: float = 0.5):
     d = check_d(d)
     if not 0 < factor < 1:
         raise ValueError("factor must be in (0, 1)")
-
-    def k(a):
-        cnt, out = _decay_exp_nb(a, d, float(factor))
-        return _gate(out, cnt, min_valid(d))
-
-    return ts_op(k)(x)
+    return _gated(x, lambda a: _decay_exp_nb(a, d, float(factor)), min_valid(d))
 
 
 @ts_op
@@ -600,12 +582,7 @@ def filter(x, h):
         h = [float(s) for s in h.split(",") if s.strip()]
     out = np.zeros_like(x)
     for k, coef in enumerate(h):
-        shifted = np.full_like(x, np.nan)
-        if k == 0:
-            shifted[:] = x
-        elif k < x.shape[0]:
-            shifted[k:] = x[:-k]
-        out = out + coef * shifted
+        out = out + coef * ts_delay(x, k)
     return out
 
 

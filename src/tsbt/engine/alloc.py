@@ -6,7 +6,7 @@ bar ``t`` and is delayed by the engine exactly like the signal, so
 
 Accepted forms for ``bt.run(..., alloc=...)``:
 
-* ``None`` / :func:`equal` - static 1/N (default)
+* ``None`` / :func:`equal` - static 1/N (default; ``run`` turns ``None`` into ``equal()``)
 * :func:`equal_active` - 1/N among symbols listed at t
 * :func:`fixed` or an ``(N,)`` array - static weights
 * a ``(T, N)`` array - arbitrary time-varying weights (used as is)
@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from tsbt.ops import ts_mean, ts_std_dev
+from tsbt.ops import inverse, ts_ir, ts_std_dev
 
 
 @dataclass
@@ -157,10 +157,7 @@ class _InvVol(Alloc):
         return {"window": self.window}
 
     def raw(self, ctx):
-        sd = ts_std_dev(ctx.ret, self.window)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            w = 1.0 / sd
-        return np.where(np.isfinite(w), w, np.nan)
+        return inverse(ts_std_dev(ctx.ret, self.window))
 
 
 def inv_vol(window: int, **kw) -> Alloc:
@@ -180,10 +177,7 @@ class _Sharpe(Alloc):
         return {"window": self.window, "floor": self.floor}
 
     def raw(self, ctx):
-        r = ctx.ret
-        with np.errstate(divide="ignore", invalid="ignore"):
-            sr = ts_mean(r, self.window) / ts_std_dev(r, self.window)
-        sr = np.where(np.isfinite(sr), sr, np.nan)
+        sr = ts_ir(ctx.ret, self.window)
         return np.where(np.isnan(sr), np.nan, np.maximum(sr, self.floor))
 
 
@@ -221,8 +215,6 @@ def custom(fn: Callable[[AllocContext], np.ndarray], normalize: bool = False, **
 
 def resolve(alloc, ctx: AllocContext) -> np.ndarray:
     T, N = ctx.listed.shape
-    if alloc is None:
-        alloc = equal()
     if isinstance(alloc, Alloc):
         w = alloc.weights(ctx)
     elif callable(alloc):
@@ -244,8 +236,6 @@ def benchmark_weights(alloc, ctx: AllocContext) -> np.ndarray:
     so the benchmark uses a plain 1/N basket instead.
     """
     N = ctx.listed.shape[1]
-    if alloc is None:
-        alloc = equal()
     if isinstance(alloc, Alloc) and alloc.static:
         return alloc.weights(ctx)[0]
     if not isinstance(alloc, Alloc) and not callable(alloc):
@@ -257,8 +247,6 @@ def benchmark_weights(alloc, ctx: AllocContext) -> np.ndarray:
 
 def describe(alloc) -> str:
     """Short text recorded in the result config."""
-    if alloc is None:
-        return repr(equal())
     if isinstance(alloc, Alloc):
         return repr(alloc)
     if callable(alloc):

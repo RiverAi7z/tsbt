@@ -17,6 +17,12 @@ from tsbt.config import DAY_MS
 ANN = 365.0
 
 
+def day_key(ms) -> np.ndarray:
+    """UTC day number a time stamp *ends*: a bar closing exactly at 00:00 belongs to
+    the day that just ended."""
+    return (np.asarray(ms, dtype=np.int64) - 1) // DAY_MS
+
+
 def daily_values(times: np.ndarray, nav: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Base point + last NAV of each UTC day.
 
@@ -26,7 +32,7 @@ def daily_values(times: np.ndarray, nav: np.ndarray) -> tuple[np.ndarray, np.nda
     """
     times = np.asarray(times, dtype=np.int64)
     nav = np.asarray(nav)
-    key = (times[1:] - 1) // DAY_MS
+    key = day_key(times[1:])
     last = np.r_[key[1:] != key[:-1], True] if len(key) else np.zeros(0, bool)
     return np.r_[times[0], times[1:][last]], np.r_[nav[0], nav[1:][last]]
 

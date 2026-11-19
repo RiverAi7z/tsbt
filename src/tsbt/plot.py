@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from tsbt import metrics as M
+from tsbt.config import DAY_MS
 
 # Palette (light surface): categorical slots in fixed order + neutral benchmark ink.
 SURFACE = "#fcfcfb"
@@ -63,10 +64,9 @@ def _headroom(ax, values, log: bool = False, top: float = 0.18):
 
 def _daily_mean(res, x):
     """Mean of a per-bar series within each UTC day (at day-end times)."""
-    key = (res.close_ms - 1) // 86_400_000
-    uk, inv = np.unique(key, return_inverse=True)
+    uk, inv = np.unique(M.day_key(res.close_ms), return_inverse=True)
     mean = np.bincount(inv, weights=x) / np.bincount(inv)
-    return ((uk + 1) * 86_400_000).astype("datetime64[ms]"), mean
+    return ((uk + 1) * DAY_MS).astype("datetime64[ms]"), mean
 
 
 def _pct(ax):
