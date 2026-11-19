@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+import warnings
 
 import numpy as np
 import polars as pl
@@ -66,7 +67,10 @@ def test_partial_bars_dropped_and_gaps_are_nan(env):
         volume=vol,
         extra=lambda df: pl.col("open_time") != drop,
     )
-    d = bt.load("NEWUSDT", "4h")
+    with pytest.warns(
+        bt.MissingDataWarning, match="NEWUSDT: klines source lacks 1 minutes in 1 4h"
+    ):
+        d = bt.load("NEWUSDT", "4h")
     assert [str(t) for t in d.ts] == ["2024-01-01T04:00:00.000", "2024-01-01T08:00:00.000"]
     m = d.m1
     assert np.isnan(m.close[90])  # 05:30 is minute 90 of the 04:00 bar
@@ -79,6 +83,31 @@ def test_partial_bars_dropped_and_gaps_are_nan(env):
     env.klines("OLDUSDT", "2023-12-25", full, volume=fv)
     both = bt.load(["OLDUSDT", "NEWUSDT"], "1D")
     assert both.T == 3 and both.listed.sum(axis=0).tolist() == [3, 0]
+
+
+def test_holes_in_the_minute_data_are_reported_when_bars_are_synthesised(env):
+    """A day without klines between two listed days must not turn into bars silently:
+    synthesis warns once per symbol with the span; cached bars load without a warning."""
+    close, vol = bar_blocks(48, 60, seed=21)
+    env.klines("GAPUSDT", "2024-01-01", close[:1440], volume=vol[:1440])
+    env.klines("GAPUSDT", "2024-01-03", close[1440:], volume=vol[1440:])
+    env.klines("FULUSDT", "2024-01-01", bar_blocks(72, 60, seed=22)[0])
+    with pytest.warns(bt.MissingDataWarning) as rec:
+        d = bt.load(["FULUSDT", "GAPUSDT"], "1h")  # 11 klines fields, one warning
+    assert [str(w.message) for w in rec] == [
+        "GAPUSDT: klines source lacks 1440 minutes in 24 1h bars "
+        "(2024-01-02 00:00 .. 2024-01-02 23:59)"
+    ]
+    assert rec[0].filename == __file__  # points at the caller, not at tsbt internals
+    assert np.isnan(d.close[24:48, 1]).all() and d.listed[24:48, 1].all()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", bt.MissingDataWarning)
+        bt.load(["FULUSDT", "GAPUSDT"], "1h")  # already synthesised: silent
+        bt.load("FULUSDT", "4h")  # complete data: silent
+    with pytest.warns(
+        bt.MissingDataWarning, match="GAPUSDT: klines source lacks 1440 minutes in 6 4h"
+    ):
+        bt.load("GAPUSDT", "4h")  # another frequency is another synthesis
 
 
 def test_cache_reuse_incremental_append_and_monthly_precedence(env, monkeypatch):
@@ -143,7 +172,10 @@ def test_metrics_are_causally_aligned(env):
     )
     oi = np.array([1.0, 2.0, 0.5, 3.0, 4.0])  # deliberately unsorted; one duplicate stamp, off-grid
     env.metrics("BTCUSDT", stamps, oi)
-    d = bt.load("BTCUSDT", "1h", fields=["close", "oi"])
+    with pytest.warns(
+        bt.MissingDataWarning, match="BTCUSDT: field 'oi' has no source data for 4 1h"
+    ):
+        d = bt.load("BTCUSDT", "1h", fields=["close", "oi"])
     # bar 01:00-02:00 sees 01:30 and 01:55 -> last = 1.0; the 02:00:00 record is NOT in it
     assert d.oi[1] == 1.0
     # bar 02:00-03:00: 02:00 (2.0) then 02:02:30 twice -> last in file order = 4.0

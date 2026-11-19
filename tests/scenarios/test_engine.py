@@ -252,7 +252,10 @@ def test_delisting_closes_and_missing_bar_holds(env):
         ),
     )
     env.klines("BBBUSDT", "2024-01-01", b, volume=vb)
-    d = bt.load(["AAAUSDT", "BBBUSDT"], "1h")
+    with pytest.warns(
+        bt.MissingDataWarning, match="AAAUSDT: klines source lacks 60 minutes in 1 1h"
+    ):
+        d = bt.load(["AAAUSDT", "BBBUSDT"], "1h")
     assert np.isnan(d.close[20, 0]) and d.listed[20, 0]
     sig = np.column_stack([np.linspace(0.2, 0.9, d.T), np.full(d.T, 0.5)])
     res = bt.run(sig, d, price="open", fee=1e-3, alloc=bt.alloc.fixed([0.5, 0.5]))

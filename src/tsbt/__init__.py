@@ -3,6 +3,7 @@
 from tsbt import ops
 from tsbt.config import set_paths
 from tsbt.data.api import BarData, M1View, fields, load, load_m1, symbols
+from tsbt.data.bars import MissingDataWarning
 from tsbt.data.features import SourceChunk, feature_set
 from tsbt.engine import alloc
 from tsbt.engine.result import BatchResult, PortfolioResult, Result
@@ -12,6 +13,7 @@ __all__ = [
     "BarData",
     "BatchResult",
     "M1View",
+    "MissingDataWarning",
     "PortfolioResult",
     "Result",
     "SourceChunk",

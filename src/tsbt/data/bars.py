@@ -7,6 +7,7 @@ axis 1.  Fixed field rules and user ``BarData.agg`` share this code path.
 
 from __future__ import annotations
 
+import os
 import re
 import warnings
 from collections.abc import Callable
@@ -17,6 +18,12 @@ from tsbt import config
 from tsbt.data import catalog, m1, store
 
 MIN = config.MINUTE_MS
+_PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+class MissingDataWarning(UserWarning):
+    """Bars were synthesised from minute data with holes inside the listing range."""
+
 
 _FREQ_RE = re.compile(r"^\s*(\d+)\s*(m|min|h|d)\s*$", re.IGNORECASE)
 
@@ -210,8 +217,15 @@ def symbol_bar_range(symbol: str, k: int, offset: int, meta: dict | None = None)
 
 
 def compute_bar_field(symbol: str, name: str, j0: int, j1: int, k: int, offset: int) -> np.ndarray:
+    return _synthesise(symbol, name, j0, j1, k, offset)[0]
+
+
+def _synthesise(symbol: str, name: str, j0: int, j1: int, k: int, offset: int):
+    """(bar values, missing): ``missing`` marks the source holes behind the bars -
+    ``(nb, w)`` absent minutes for a dense (klines) field, ``(nb,)`` bars without any
+    value for a sparse one. Bars [j0, j1) all lie inside the symbol's listing range."""
     if j1 <= j0:
-        return np.empty(0)
+        return np.empty(0), np.zeros(0, dtype=bool)
     s_ms, e_ms = int(bar_open_ms(j0, k, offset)), int(bar_open_ms(j1, k, offset))
     base, window = catalog.parse_exec_field(name)
     w = k if window is None else window
@@ -225,14 +239,53 @@ def compute_bar_field(symbol: str, name: str, j0: int, j1: int, k: int, offset: 
         )
         twap = REDUCERS["mean"](catalog.minute_price(qv, v, c))
         if base == "twap":
-            return twap
+            return twap, ~np.isfinite(c)
         sq, sv = _red_sum(qv), _red_sum(v)
         with np.errstate(invalid="ignore", divide="ignore"):
             vwap = sq / sv
-        return np.where((sv > 0) & np.isfinite(vwap), vwap, twap)
+        return np.where((sv > 0) & np.isfinite(vwap), vwap, twap), ~np.isfinite(c)
     spec = catalog.spec_for(name)
     x = catalog.minute_values(symbol, name, s_ms, e_ms).reshape(nb, k)
-    return reduce(x, spec.rule)
+    out = reduce(x, spec.rule)
+    if spec.dense:
+        return out, ~np.isfinite(x)
+    if k < spec.m1_ffill:  # a bar shorter than the source's cadence may be empty
+        return out, np.zeros(nb, dtype=bool)
+    return out, ~np.isfinite(out)
+
+
+def _warn_missing(symbol, name, k, offset, j0, missing, meta) -> None:
+    """Report the holes found while synthesising ``name``: once per symbol and source
+    for klines fields (they share their rows), once per field otherwise."""
+    if not missing.any():
+        return
+    spec = catalog.spec_for(name)
+    dense = missing.ndim == 2
+    key = ("warned", symbol, spec.builder if dense else name, k, offset)
+    if meta is not None:
+        if key in meta:
+            return
+        meta[key] = True
+    opens = bar_open_ms(j0 + np.arange(missing.shape[0]), k, offset)
+    freq = freq_label(k)
+    if dense:
+        flat = missing.ravel()
+        t = (opens[:, None] + np.arange(missing.shape[1]) * MIN).ravel()
+        n_bars = int(missing.any(axis=1).sum())
+        what = f"{spec.builder} source lacks {int(flat.sum())} minutes in {n_bars} {freq} bars"
+    else:
+        flat, t = missing, opens
+        what = f"field {name!r} has no source data for {int(flat.sum())} {freq} bars"
+    runs = np.flatnonzero(np.diff(np.r_[False, flat, False])).reshape(-1, 2)  # [a, z)
+    spans = "; ".join(f"{_iso(t[a])} .. {_iso(t[z - 1])}" for a, z in runs[:3])
+    if len(runs) > 3:
+        spans += f"; +{len(runs) - 3} more"
+    warnings.warn(f"{symbol}: {what} ({spans})", MissingDataWarning, skip_file_prefixes=(_PKG_DIR,))
+
+
+def _iso(ms) -> str:
+    t = np.datetime64(int(ms), "ms").astype("datetime64[m]")
+    return str(t).replace("T", " ")
 
 
 def tag_path(bar_tag: str, symbol: str, name: str | None = None) -> str:
@@ -274,11 +327,12 @@ def ensure_bar_field(
         return j0, j1
     path = _bar_path(k, offset, symbol, name)
     with store.symbol_lock(symbol):
-        vals = compute_bar_field(symbol, name, j0, j1, k, offset)
+        vals, missing = _synthesise(symbol, name, j0, j1, k, offset)
         store.delete(path)
         store.write(path, j0, vals)
         store.set_attr(gpath, field_attr(name), want)
     attrs[field_attr(name)] = want
+    _warn_missing(symbol, name, k, offset, j0, missing, meta)  # after the cache is written
     return j0, j1
 
 

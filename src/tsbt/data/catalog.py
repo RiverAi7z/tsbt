@@ -17,6 +17,12 @@ class FieldSpec:
     #: forward-fill limit (minutes) for the minute view; sparse sources only
     m1_ffill: int = 0
 
+    @property
+    def dense(self) -> bool:
+        """klines define the minute grid: every minute of the listing range must exist.
+        Other sources are sparse, so only a bar without any value counts as missing."""
+        return self.builder == "klines"
+
 
 BUILTIN_FIELDS: dict[str, FieldSpec] = {
     "open": FieldSpec("open", "klines", "first"),
