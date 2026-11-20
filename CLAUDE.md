@@ -10,14 +10,15 @@ A `funding_rate` row stamped `t` is the rate settled at `t` for the 8h period th
 
 Pass the window to `bt.run` with `start` / `end`. `end` is exclusive.
 
-| Segment | start | end |
-|---|---|---|
-| Train (IS) | 2023-01-01 | 2025-01-01 |
-| Validation | 2025-01-01 | 2026-01-01 |
-| Test (OOS) | 2026-01-01 | (data end) |
+Current split (set 2026-11-19). IS covers both bull and bear regimes:
 
-- **Never evaluate on the test segment unless the user explicitly asks for it in that conversation.** Calling `bt.run` without `end` evaluates through the end of the data, test segment included. While iterating, always pass `end="2026-01-01"` or earlier.
-- Do not use validation results to tune parameters step by step. Validation is a go / no-go check against criteria written down before running it.
+| Segment | start | end | use |
+|---|---|---|---|
+| IS | 2023-01-01 | 2026-07-01 | research; model choice by time-block cross-validation inside IS |
+| Holdout | 2026-07-01 | (data end) | one look, final signal only, then paper trading |
+
+- **Never evaluate on the holdout unless the user explicitly asks for it in that conversation.** Calling `bt.run` without `end` evaluates through the end of the data, holdout included. While iterating, always pass `end="2026-07-01"` or earlier.
+- Choose parameters and models with time-block cross-validation inside IS (purged, with an embargo), not by repeatedly checking one fixed window.
 - When reporting a Sharpe ratio, state the window and give its standard error (about 1/√years).
 
 ## Research log (outside the package)
